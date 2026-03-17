@@ -1,0 +1,10 @@
+{
+  "primary_code": "def handle_auth(self, r, **kwargs):\n    \"\"\"Takes the given Response and tries digest-auth, if needed.\"\"\"\n    num_401_calls = getattr(self, 'num_401_calls', 1)\n    s_auth = r.headers.get('www-authenticate', '')\n\n    if 'digest' in s_auth.lower() and num_401_calls < 2:\n        self.num_401_calls += 1\n        pat = re.compile(r'digest ', re.IGNORECASE)\n        self.init_poolmanager(self.num_pools, self.maxsize,\n                              block=self.block)\n        prep = r.request.copy()\n        extract_cookies_to_jar(prep._cookies, r.request, r.raw)\n        prep.prepare_cookies(prep._cookies)\n        prep.auth = self.build_digest_header(prep.method, prep.url)\n        _r = r.connection.send(prep, **kwargs)\n        _r.history.append(r)\n        _r.request = prep\n        return _r\n    self.num_401_calls = 1\n    return r\n",
+  "dependencies_code": {
+    "extract_cookies_to_jar": "def extract_cookies_to_jar(jar, request, response):\n    \"\"\"Extract the cookies from the response into given cookiejar.\"\"\"\n    ...",
+    "re.compile": "def compile(pattern, flags=0):\n    \"\"\"Compile a regular expression pattern, returning a Pattern object.\"\"\"\n    ..."
+  },
+  "graph_depth_used": 1,
+  "tokens_used": 412,
+  "fallback_used": false
+}
