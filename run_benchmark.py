@@ -46,6 +46,9 @@ def _setup_cost_tracking() -> None:
     try:
         import litellm
 
+        # Retry up to 6 times on rate limit / transient errors with exponential backoff
+        litellm.num_retries = 6
+
         def _cost_callback(kwargs, response, start_time, end_time):
             try:
                 cost = litellm.completion_cost(completion_response=response)
