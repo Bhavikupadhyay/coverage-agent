@@ -2,6 +2,7 @@ import ast
 import logging
 import os
 import sys
+from pathlib import Path
 
 import litellm
 
@@ -45,25 +46,33 @@ def _extract_imports(test_code: str) -> list[str]:
     return modules
 
 
-def _find_unknown_imports(test_code: str, context: ContextPayload) -> list[str]:
+def _find_unknown_imports(
+    test_code: str, context: ContextPayload, gap: CoverageGap
+) -> list[str]:
     """
-    Returns imports that are neither stdlib nor present as a key in
-    context.dependencies_code. The target file's own package root is
-    treated as known.
+    Returns imports that are neither stdlib nor plausibly known given the context.
+
+    Known modules include:
+    - All stdlib top-level names
+    - pytest / unittest / mock (universal test utilities)
+    - The top-level package of the file under test (e.g. "requests" from "requests/auth.py")
+    - Module roots extracted from dependency keys (e.g. "re" from "re.compile")
     """
     imported = _extract_imports(test_code)
-    known_names = set(context.dependencies_code.keys())
+
+    # Target package root: "requests/auth.py" → "requests"
+    target_pkg = Path(gap.file_path).parts[0].replace(".py", "") if gap.file_path else ""
+    # Module roots from dependency names: "re.compile" → "re", "extract_cookies_to_jar" → itself
+    dep_module_roots = {k.split(".")[0] for k in context.dependencies_code}
+
+    known = _STDLIB_MODULES | {"pytest", "unittest", "mock"} | dep_module_roots
+    if target_pkg:
+        known.add(target_pkg)
 
     unknown = []
     for mod in imported:
-        if mod in _STDLIB_MODULES:
-            continue
-        if mod in known_names:
-            continue
-        # Common test utilities and the project's own package are always OK
-        if mod in {"pytest", "unittest", "mock"}:
-            continue
-        unknown.append(mod)
+        if mod not in known:
+            unknown.append(mod)
     return unknown
 
 
@@ -101,7 +110,7 @@ class EvalAgent:
             )
 
         # --- Phase 1b: Import plausibility (deterministic) ---
-        unknown_imports = _find_unknown_imports(draft.test_code, context)
+        unknown_imports = _find_unknown_imports(draft.test_code, context, gap)
 
         if _is_dry_run():
             logger.info("[DRY_RUN] EvalAgent — returning passing stub for %s", gap.gap_id)

@@ -1,5 +1,6 @@
 import logging
 import os
+from pathlib import Path
 
 import litellm
 
@@ -42,15 +43,22 @@ class ContextArchitect:
         Asks the LLM what graph_depth is needed to understand the target gap.
         Returns 0, 1, or 2. Falls back to 1 on any failure.
         """
-        source_preview = "\n".join(
-            f"line {ln}" for ln in gap.surrounding_lines[:10]
-        )
+        try:
+            source_lines = Path(gap.file_path).read_text(encoding="utf-8").splitlines()
+            source_preview = "\n".join(
+                f"{ln}: {source_lines[ln - 1]}"
+                for ln in gap.surrounding_lines[:20]
+                if 0 < ln <= len(source_lines)
+            )
+        except Exception:
+            source_preview = "\n".join(f"line {ln}" for ln in gap.surrounding_lines[:20])
+
         prompt = (
             f"You are analyzing a Python coverage gap to decide how much context is needed.\n\n"
             f"File: {gap.file_path}\n"
             f"Function: {gap.target_symbol}\n"
             f"Uncovered branch: line {gap.branch.from_line} -> line {gap.branch.to_line}\n"
-            f"Function spans lines: {source_preview}\n\n"
+            f"Function source:\n{source_preview}\n\n"
             "Decide the graph_depth needed:\n"
             "  0 = the target function source alone is sufficient\n"
             "  1 = need target + its immediate callees (most common)\n"
