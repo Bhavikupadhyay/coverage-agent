@@ -50,7 +50,7 @@ def _context_architect_node(state: PipelineState) -> dict:
     # First run (loop_count==0): LLM decides depth.
     # Retry runs after RECONTEXTUALIZE: use the incremented override.
     depth_override = state["context_depth_requested"] if state["loop_count"] > 0 else None
-    context = ContextArchitect().run(state["target_gap"], depth_override=depth_override)
+    context = ContextArchitect().run(state["target_gap"], depth_override=depth_override, repo_root=state["repo_path"])
     logger.info(
         "context_architect: gap=%s depth=%d tokens=%d",
         state["target_gap"].gap_id,
@@ -207,7 +207,7 @@ def run_pipeline(
     baseline_coverage_path: str,
     sandbox: E2BSandbox,
     braintrust_logger=None,
-) -> GapResult:
+) -> tuple[GapResult, PipelineState]:
     """
     Runs one gap through the full LangGraph pipeline.
 
@@ -245,4 +245,4 @@ def run_pipeline(
     if braintrust_logger is not None:
         braintrust_logger.log(gap_result, final_state)
 
-    return gap_result
+    return gap_result, final_state
