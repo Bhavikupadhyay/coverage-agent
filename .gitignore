@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment / secrets
+.env
+
+# Coverage
+.coverage
+coverage.json
+htmlcov/
+
+# pytest
+.pytest_cache/
+.cache/
+
+# mypy
+.mypy_cache/
+
+# ruff
+.ruff_cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Benchmark outputs
+eval_dataset.jsonl
+benchmarks/*/
+!benchmarks/requests/
+!benchmarks/pydantic/
+!benchmarks/click/
