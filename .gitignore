@@ -21,6 +21,7 @@ env/
 .coverage
 coverage.json
 htmlcov/
+.coverage_baseline_agent.json
 
 # pytest
 .pytest_cache/
