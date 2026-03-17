@@ -81,15 +81,18 @@ def main() -> int:
     if args.dry_run:
         os.environ["DRY_RUN"] = "true"
 
-    dry_run = os.environ.get("DRY_RUN", "false").lower() == "true"
-
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s — %(message)s",
         stream=sys.stderr,
     )
 
-    _ensure_env(dry_run)
+    # Load .env before evaluating dry_run so DRY_RUN in .env is respected,
+    # but --dry-run flag already set above takes precedence via setdefault.
+    _ensure_env(args.dry_run)
+
+    # Recompute after .env is loaded
+    dry_run = os.environ.get("DRY_RUN", "false").lower() == "true"
     _setup_cost_tracking()
 
     braintrust_logger = None

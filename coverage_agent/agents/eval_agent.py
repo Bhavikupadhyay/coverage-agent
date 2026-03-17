@@ -217,9 +217,9 @@ class EvalAgent:
             "  4 = checks return value AND a side effect or exception type\n"
             "  5 = rigorously asserts specific return values, side effects, or exception "
             "types and mock call counts\n\n"
-            "Respond with:\n"
-            "<score>\n"
-            "<one sentence of feedback if score <= 3, else empty>"
+            "Respond with exactly two lines:\n"
+            "Line 1: a single integer between 1 and 5\n"
+            "Line 2: one sentence of feedback if the score is 3 or below, otherwise leave it blank"
         )
         try:
             response = litellm.completion(
