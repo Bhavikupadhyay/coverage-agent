@@ -132,6 +132,23 @@ def build_context(file_path: str, target_symbol: str, depth: int = 1) -> Context
 
         depth_used = 1
 
+    if depth >= 2 and not fallback_used and dependencies:
+        depth2: dict[str, str] = {}
+        for callee_name in list(dependencies):
+            sub_callees = _extract_callees(file_path, callee_name)
+            for name, source in sub_callees.items():
+                if name in dependencies or name in depth2:
+                    continue
+                candidate_tokens = _count_tokens(source)
+                if tokens_so_far + candidate_tokens > MAX_CONTEXT_TOKENS:
+                    logger.debug("Token budget reached at depth 2 — stopping before %s", name)
+                    break
+                depth2[name] = source
+                tokens_so_far += candidate_tokens
+        if depth2:
+            dependencies.update(depth2)
+            depth_used = 2
+
     tokens_used = _count_tokens(primary_code) + sum(_count_tokens(v) for v in dependencies.values())
 
     return ContextPayload(

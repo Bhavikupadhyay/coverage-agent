@@ -75,7 +75,12 @@ class E2BSandbox:
         coverage_raw = self._sandbox.filesystem.read("/repo/coverage.json")
         return json.loads(coverage_raw)
 
-    def run_test(self, test_code: str, gap_id: str = "unknown") -> ExecutionResult:
+    def run_test(
+        self,
+        test_code: str,
+        gap_id: str = "unknown",
+        baseline_coverage_pct: float = 0.0,
+    ) -> ExecutionResult:
         """
         Writes the test to the sandbox, runs it, measures coverage delta,
         then deletes the test file. Returns an ExecutionResult.
@@ -109,9 +114,8 @@ class E2BSandbox:
                 try:
                     after_raw = self._sandbox.filesystem.read("/repo/coverage_after.json")
                     after = json.loads(after_raw)
-                    baseline_pct = 0.0  # Orchestrator provides this in real impl
                     after_pct = after.get("totals", {}).get("percent_covered", 0.0)
-                    coverage_delta = round(after_pct - baseline_pct, 2)
+                    coverage_delta = round(after_pct - baseline_coverage_pct, 2)
                 except Exception as exc:
                     logger.warning("Could not parse post-run coverage: %s", exc)
 
