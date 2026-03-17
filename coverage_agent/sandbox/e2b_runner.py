@@ -80,10 +80,15 @@ class E2BSandbox:
         test_code: str,
         gap_id: str = "unknown",
         baseline_coverage_pct: float = 0.0,
+        target_file: str = "",
+        target_from_line: int = 0,
+        target_to_line: int = 0,
+        baseline_missing_branches: list | None = None,
     ) -> ExecutionResult:
         """
-        Writes the test to the sandbox, runs it, measures coverage delta,
-        then deletes the test file. Returns an ExecutionResult.
+        Writes the test to the sandbox, runs it, measures coverage delta and
+        whether the specific target branch was newly covered, then deletes the
+        test file. Returns an ExecutionResult.
         """
         if _is_dry_run():
             logger.info("[DRY_RUN] run_test — returning fixture ExecutionResult for gap %s", gap_id)
@@ -116,6 +121,15 @@ class E2BSandbox:
                     after = json.loads(after_raw)
                     after_pct = after.get("totals", {}).get("percent_covered", 0.0)
                     coverage_delta = round(after_pct - baseline_coverage_pct, 2)
+
+                    if target_file and target_file in after.get("files", {}):
+                        newly_executed = after["files"][target_file].get("executed_branches", [])
+                        target_branch = [target_from_line, target_to_line]
+                        was_missing = (
+                            baseline_missing_branches is None
+                            or target_branch in baseline_missing_branches
+                        )
+                        target_branch_hit = was_missing and target_branch in newly_executed
                 except Exception as exc:
                     logger.warning("Could not parse post-run coverage: %s", exc)
 
