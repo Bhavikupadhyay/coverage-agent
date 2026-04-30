@@ -1,6 +1,6 @@
 import logging
 import os
-from typing import Optional, TypedDict
+from typing import Callable, Optional, TypedDict
 
 from langgraph.graph import END, StateGraph
 
@@ -149,23 +149,51 @@ def _route_after_eval(state: PipelineState) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Node tracing wrapper
+# ---------------------------------------------------------------------------
+
+def _traced(
+    fn: Callable,
+    name: str,
+    cb: Optional[Callable],
+) -> Callable:
+    """Wraps a node function to emit agent_start / agent_end events via cb."""
+    def _inner(state: PipelineState) -> dict:
+        gap_id = state["target_gap"].gap_id if state.get("target_gap") else ""
+        loop = state.get("loop_count", 0)
+        if cb:
+            cb("agent_start", name, loop, gap_id, {})
+        result = fn(state)
+        if cb:
+            cb("agent_end", name, loop, gap_id, {})
+        return result
+    return _inner
+
+
+# ---------------------------------------------------------------------------
 # Graph factory
 # ---------------------------------------------------------------------------
 
-def build_pipeline(sandbox: E2BSandbox):
+def build_pipeline(
+    sandbox: E2BSandbox,
+    event_callback: Optional[Callable] = None,
+):
     """
     Builds and compiles the LangGraph pipeline for a single gap.
 
     The sandbox is captured via closure so it can be reused across all gaps
     in a benchmark run without being serialized into PipelineState.
+    If event_callback is provided it is called as:
+        cb(event_type, agent_name, loop_count, gap_id, data)
     """
     graph = StateGraph(PipelineState)
+    cb = event_callback
 
-    graph.add_node("context_architect", _make_context_architect_node(sandbox))
-    graph.add_node("test_writer", _test_writer_node)
-    graph.add_node("eval_agent", _eval_agent_node)
-    graph.add_node("execution_runner", _make_execution_runner_node(sandbox))
-    graph.add_node("skip", _skip_node)
+    graph.add_node("context_architect", _traced(_make_context_architect_node(sandbox), "context_architect", cb))
+    graph.add_node("test_writer", _traced(_test_writer_node, "test_writer", cb))
+    graph.add_node("eval_agent", _traced(_eval_agent_node, "eval_agent", cb))
+    graph.add_node("execution_runner", _traced(_make_execution_runner_node(sandbox), "execution_runner", cb))
+    graph.add_node("skip", _traced(_skip_node, "skip", cb))
 
     graph.set_entry_point("context_architect")
     graph.add_edge("context_architect", "test_writer")
@@ -198,6 +226,7 @@ def run_pipeline(
     baseline_coverage: dict,
     repo_path: str = "",
     braintrust_logger=None,
+    event_callback: Optional[Callable] = None,
 ) -> tuple[GapResult, PipelineState]:
     """
     Runs one gap through the full LangGraph pipeline.
@@ -206,7 +235,7 @@ def run_pipeline(
     reused across all gaps via closure. Returns a GapResult. If a
     BraintrustLogger is provided, the result is logged before returning.
     """
-    compiled = build_pipeline(sandbox)
+    compiled = build_pipeline(sandbox, event_callback=event_callback)
 
     initial_state: PipelineState = {
         "repo_path": repo_path,
