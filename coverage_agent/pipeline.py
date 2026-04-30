@@ -1,7 +1,5 @@
-import json
 import logging
 import os
-from pathlib import Path
 from typing import Optional, TypedDict
 
 from langgraph.graph import END, StateGraph
@@ -27,7 +25,7 @@ class PipelineState(TypedDict):
     # Inputs — set by Orchestrator before each gap
     repo_path: str
     target_gap: CoverageGap
-    baseline_coverage_path: str       # path to baseline coverage JSON on disk
+    baseline_coverage: dict           # coverage.json dict from run_coverage_baseline()
 
     # Agent outputs — populated as pipeline runs
     context: Optional[ContextPayload]
@@ -46,18 +44,23 @@ class PipelineState(TypedDict):
 # Node functions
 # ---------------------------------------------------------------------------
 
-def _context_architect_node(state: PipelineState) -> dict:
-    # First run (loop_count==0): LLM decides depth.
-    # Retry runs after RECONTEXTUALIZE: use the incremented override.
-    depth_override = state["context_depth_requested"] if state["loop_count"] > 0 else None
-    context = ContextArchitect().run(state["target_gap"], depth_override=depth_override, repo_root=state["repo_path"])
-    logger.info(
-        "context_architect: gap=%s depth=%d tokens=%d",
-        state["target_gap"].gap_id,
-        context.graph_depth_used,
-        context.tokens_used,
-    )
-    return {"context": context}
+def _make_context_architect_node(sandbox: E2BSandbox):
+    def _context_architect_node(state: PipelineState) -> dict:
+        depth_override = state["context_depth_requested"] if state["loop_count"] > 0 else None
+        context = ContextArchitect().run(
+            state["target_gap"],
+            depth_override=depth_override,
+            repo_root=state["repo_path"],
+            sandbox=sandbox,
+        )
+        logger.info(
+            "context_architect: gap=%s depth=%d tokens=%d",
+            state["target_gap"].gap_id,
+            context.graph_depth_used,
+            context.tokens_used,
+        )
+        return {"context": context}
+    return _context_architect_node
 
 
 def _test_writer_node(state: PipelineState) -> dict:
@@ -101,23 +104,11 @@ def _eval_agent_node(state: PipelineState) -> dict:
 
 def _make_execution_runner_node(sandbox: E2BSandbox):
     def _execution_runner_node(state: PipelineState) -> dict:
-        baseline_coverage: dict = {}
-        try:
-            baseline_coverage = json.loads(
-                Path(state["baseline_coverage_path"]).read_text(encoding="utf-8")
-            )
-        except Exception as exc:
-            logger.warning(
-                "Could not read baseline coverage from %s: %s",
-                state["baseline_coverage_path"],
-                exc,
-            )
-
         exec_result = ExecutionRunner().run(
             state["draft_test"],
             state["target_gap"],
             sandbox,
-            baseline_coverage=baseline_coverage,
+            baseline_coverage=state.get("baseline_coverage", {}),
         )
         logger.info(
             "execution_runner: gap=%s success=%s branch_hit=%s delta=%.2f",
@@ -170,7 +161,7 @@ def build_pipeline(sandbox: E2BSandbox):
     """
     graph = StateGraph(PipelineState)
 
-    graph.add_node("context_architect", _context_architect_node)
+    graph.add_node("context_architect", _make_context_architect_node(sandbox))
     graph.add_node("test_writer", _test_writer_node)
     graph.add_node("eval_agent", _eval_agent_node)
     graph.add_node("execution_runner", _make_execution_runner_node(sandbox))
@@ -203,9 +194,9 @@ def build_pipeline(sandbox: E2BSandbox):
 
 def run_pipeline(
     gap: CoverageGap,
-    repo_path: str,
-    baseline_coverage_path: str,
     sandbox: E2BSandbox,
+    baseline_coverage: dict,
+    repo_path: str = "",
     braintrust_logger=None,
 ) -> tuple[GapResult, PipelineState]:
     """
@@ -220,7 +211,7 @@ def run_pipeline(
     initial_state: PipelineState = {
         "repo_path": repo_path,
         "target_gap": gap,
-        "baseline_coverage_path": baseline_coverage_path,
+        "baseline_coverage": baseline_coverage,
         "context": None,
         "draft_test": None,
         "eval_result": None,

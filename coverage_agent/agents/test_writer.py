@@ -1,20 +1,15 @@
 import logging
-import os
 import re
 from pathlib import Path
 
 import litellm
 
+from coverage_agent.config import get_model, is_dry_run
 from coverage_agent.contracts.schemas import ContextPayload, CoverageGap, DraftTest
 
 logger = logging.getLogger(__name__)
 
-_MODEL = "gemini/gemini-2.5-flash"
 _FIXTURES_DIR = Path(__file__).parent.parent / "fixtures"
-
-
-def _is_dry_run() -> bool:
-    return os.environ.get("DRY_RUN", "false").lower() == "true"
 
 
 _SYSTEM_PROMPT = """\
@@ -59,7 +54,7 @@ class TestWriter:
         context: ContextPayload,
         critique: str | None = None,
     ) -> DraftTest:
-        if _is_dry_run():
+        if is_dry_run():
             logger.info("[DRY_RUN] TestWriter — returning fixture test for %s", gap.gap_id)
             test_code = (_FIXTURES_DIR / "sample_test.py").read_text(encoding="utf-8")
             return DraftTest(
@@ -108,13 +103,13 @@ class TestWriter:
 
         try:
             response = litellm.completion(
-                model=_MODEL,
+                model=get_model(),
                 messages=[
                     {"role": "system", "content": _SYSTEM_PROMPT},
                     {"role": "user", "content": user_prompt},
                 ],
             )
-            content = response.choices[0].message.content
+            content = response.choices[0].message.content or ""
             return _extract_code_block(content)
         except Exception as exc:
             logger.error("TestWriter LLM call failed: %s", exc)

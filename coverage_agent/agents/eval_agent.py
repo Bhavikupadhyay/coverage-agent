@@ -1,23 +1,17 @@
 import ast
 import logging
-import os
 import sys
 from pathlib import Path
 
 import litellm
 
+from coverage_agent.config import get_model, is_dry_run
 from coverage_agent.contracts.schemas import ContextPayload, CoverageGap, DraftTest, EvalResult
 
 logger = logging.getLogger(__name__)
 
-_MODEL = "gemini/gemini-2.5-flash"
-
 # Standard library top-level module names (Python 3.11)
 _STDLIB_MODULES = set(sys.stdlib_module_names)
-
-
-def _is_dry_run() -> bool:
-    return os.environ.get("DRY_RUN", "false").lower() == "true"
 
 
 def _check_syntax(test_code: str) -> bool:
@@ -112,7 +106,7 @@ class EvalAgent:
         # --- Phase 1b: Import plausibility (deterministic) ---
         unknown_imports = _find_unknown_imports(draft.test_code, context, gap)
 
-        if _is_dry_run():
+        if is_dry_run():
             logger.info("[DRY_RUN] EvalAgent — returning passing stub for %s", gap.gap_id)
             return EvalResult(
                 syntax_valid=True,
@@ -188,7 +182,7 @@ class EvalAgent:
         )
         try:
             response = litellm.completion(
-                model=_MODEL,
+                model=get_model(),
                 messages=[{"role": "user", "content": prompt}],
             )
             content = response.choices[0].message.content.strip()
@@ -223,7 +217,7 @@ class EvalAgent:
         )
         try:
             response = litellm.completion(
-                model=_MODEL,
+                model=get_model(),
                 messages=[{"role": "user", "content": prompt}],
             )
             lines = response.choices[0].message.content.strip().splitlines()

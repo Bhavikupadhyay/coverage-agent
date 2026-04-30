@@ -1,30 +1,21 @@
 import json
 import logging
-import os
-from pathlib import Path
 
 import litellm
 
+from coverage_agent.config import get_model, is_dry_run
 from coverage_agent.contracts.schemas import CoverageGap
-from coverage_agent.context.coverage_parser import parse_coverage
 
 logger = logging.getLogger(__name__)
 
-_MODEL = "gemini/gemini-2.5-flash"
-
-
-def _is_dry_run() -> bool:
-    return os.environ.get("DRY_RUN", "false").lower() == "true"
-
 
 class GapPrioritizer:
-    def run(self, coverage_json: dict) -> list[CoverageGap]:
-        gaps = parse_coverage(coverage_json)
+    def run(self, gaps: list[CoverageGap]) -> list[CoverageGap]:
         if not gaps:
             logger.info("No coverage gaps found — nothing to prioritize")
             return []
 
-        if _is_dry_run():
+        if is_dry_run():
             logger.info("[DRY_RUN] GapPrioritizer — assigning mock priority scores")
             return [
                 gap.model_copy(update={"priority_score": round(1.0 - i * 0.1, 2)})
@@ -53,7 +44,7 @@ class GapPrioritizer:
         )
         try:
             response = litellm.completion(
-                model=_MODEL,
+                model=get_model(),
                 messages=[{"role": "user", "content": prompt}],
             )
             content = response.choices[0].message.content.strip()

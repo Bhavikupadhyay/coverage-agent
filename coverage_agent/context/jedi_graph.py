@@ -1,13 +1,13 @@
 import inspect
 import json
 import logging
-import os
 import textwrap
 from pathlib import Path
 
 import jedi
 import litellm
 
+from coverage_agent.config import is_dry_run
 from coverage_agent.contracts.schemas import ContextPayload
 
 logger = logging.getLogger(__name__)
@@ -15,10 +15,6 @@ logger = logging.getLogger(__name__)
 MAX_CONTEXT_TOKENS = 15000
 
 _FIXTURES_DIR = Path(__file__).parent.parent / "fixtures"
-
-
-def _is_dry_run() -> bool:
-    return os.environ.get("DRY_RUN", "false").lower() == "true"
 
 
 def _count_tokens(text: str) -> int:
@@ -32,8 +28,9 @@ def _count_tokens(text: str) -> int:
 def _extract_function_source(file_path: str, target_symbol: str) -> str | None:
     """Uses Jedi to find and return the source of the target function."""
     try:
-        source = Path(file_path).read_text(encoding="utf-8")
-        script = jedi.Script(source, path=file_path)
+        resolved = Path(file_path)
+        source = resolved.read_text(encoding="utf-8")
+        script = jedi.Script(source, path=str(resolved))
         names = script.get_names(all_scopes=True, definitions=True)
 
         for name in names:
@@ -60,8 +57,9 @@ def _extract_callees(file_path: str, target_symbol: str) -> dict[str, str]:
     """
     dependencies: dict[str, str] = {}
     try:
-        source = Path(file_path).read_text(encoding="utf-8")
-        script = jedi.Script(source, path=file_path)
+        resolved = Path(file_path)
+        source = resolved.read_text(encoding="utf-8")
+        script = jedi.Script(source, path=str(resolved))
         names = script.get_names(all_scopes=True, references=True)
 
         for name in names:
@@ -83,36 +81,46 @@ def _extract_callees(file_path: str, target_symbol: str) -> dict[str, str]:
     return dependencies
 
 
-def build_context(file_path: str, target_symbol: str, depth: int = 1) -> ContextPayload:
+def build_context(
+    file_path: str,
+    target_symbol: str,
+    depth: int = 1,
+    repo_root: str = ".",
+) -> ContextPayload:
     """
     Constructs a ContextPayload for the given target symbol.
+
+    file_path is repo-relative (e.g. "requests/auth.py"). repo_root is the
+    local path to the cloned repository. All file reads are resolved as
+    Path(repo_root) / file_path.
 
     In DRY_RUN mode, returns the fixture from fixtures/sample_context.json.
 
     Depth 0: target function source only.
     Depth 1: target + immediate callees resolved via Jedi goto().
+    Depth 2: target + callees + their callees (within token budget).
 
-    Token budget is enforced at MAX_CONTEXT_TOKENS = 15000. If adding the next
-    depth level would exceed the budget, traversal stops at the current depth.
-    If Jedi resolution fails entirely, falls back to local file scope with
-    fallback_used=True.
+    Token budget is enforced at MAX_CONTEXT_TOKENS = 15000. Traversal stops
+    when adding the next level would exceed the budget.
+    Falls back to local file scope with fallback_used=True if Jedi fails.
     """
-    if _is_dry_run():
+    if is_dry_run():
         fixture_path = _FIXTURES_DIR / "sample_context.json"
         data = json.loads(fixture_path.read_text(encoding="utf-8"))
         logger.info("[DRY_RUN] build_context returning fixture for %s:%s", file_path, target_symbol)
         return ContextPayload(**data)
 
+    resolved_path = str(Path(repo_root) / file_path)
     fallback_used = False
-    primary_code = _extract_function_source(file_path, target_symbol)
+    primary_code = _extract_function_source(resolved_path, target_symbol)
 
     if primary_code is None:
         # Fallback: return entire file as primary_code
-        logger.warning("Jedi could not locate %s in %s — falling back to file scope", target_symbol, file_path)
+        logger.warning("Jedi could not locate %s in %s — falling back to file scope", target_symbol, resolved_path)
         try:
-            primary_code = Path(file_path).read_text(encoding="utf-8")
+            primary_code = Path(resolved_path).read_text(encoding="utf-8")
         except Exception:
-            primary_code = f"# Could not read {file_path}"
+            primary_code = f"# Could not read {resolved_path}"
         fallback_used = True
 
     dependencies: dict[str, str] = {}
@@ -120,7 +128,7 @@ def build_context(file_path: str, target_symbol: str, depth: int = 1) -> Context
 
     if depth >= 1 and not fallback_used:
         tokens_so_far = _count_tokens(primary_code)
-        callees = _extract_callees(file_path, target_symbol)
+        callees = _extract_callees(resolved_path, target_symbol)
 
         for name, source in callees.items():
             candidate_tokens = _count_tokens(source)
@@ -135,7 +143,7 @@ def build_context(file_path: str, target_symbol: str, depth: int = 1) -> Context
     if depth >= 2 and not fallback_used and dependencies:
         depth2: dict[str, str] = {}
         for callee_name in list(dependencies):
-            sub_callees = _extract_callees(file_path, callee_name)
+            sub_callees = _extract_callees(resolved_path, callee_name)
             for name, source in sub_callees.items():
                 if name in dependencies or name in depth2:
                     continue
