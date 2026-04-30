@@ -1,4 +1,5 @@
 import logging
+from typing import Callable, Optional
 
 from coverage_agent.config import is_dry_run
 from coverage_agent.agents.gap_prioritizer import GapPrioritizer
@@ -26,6 +27,7 @@ class Orchestrator:
         repo_url_or_path: str,
         max_gaps: int = 10,
         braintrust_logger=None,
+        event_callback: Optional[Callable] = None,
     ) -> tuple[dict, list[GapResult]]:
         sandbox = E2BSandbox(repo_url_or_path)
         try:
@@ -42,14 +44,22 @@ class Orchestrator:
         logger.info("Orchestrator: %d gaps to process (max=%d)", len(priority_queue), max_gaps)
 
         results: list[GapResult] = []
+        total_gaps = len(priority_queue)
         try:
-            for gap in priority_queue:
+            for i, gap in enumerate(priority_queue):
+                if event_callback:
+                    event_callback("gap_start", "orchestrator", 0, gap.gap_id, {
+                        "gap_idx": i + 1,
+                        "total_gaps": total_gaps,
+                    })
+
                 sandbox.pause()
                 gap_result, final_state = run_pipeline(
                     gap=gap,
                     sandbox=sandbox,
                     baseline_coverage=baseline_coverage,
                     braintrust_logger=braintrust_logger,
+                    event_callback=event_callback,
                 )
                 if (
                     not gap_result.skipped
@@ -62,6 +72,17 @@ class Orchestrator:
                             "final_test_committed": True,
                             "test_code": draft.test_code,
                         })
+
+                original_code = ""
+                ctx = final_state.get("context")
+                if ctx is not None:
+                    original_code = ctx.primary_code
+
+                if event_callback:
+                    event_callback("gap_end", "orchestrator", 0, gap.gap_id, {
+                        "original_code": original_code,
+                        "committed": gap_result.final_test_committed,
+                    })
 
                 results.append(gap_result)
                 logger.info(

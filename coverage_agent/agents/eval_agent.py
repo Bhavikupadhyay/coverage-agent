@@ -1,6 +1,10 @@
 import ast
+import json
 import logging
+import os
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import litellm
@@ -20,6 +24,43 @@ def _check_syntax(test_code: str) -> bool:
         return True
     except SyntaxError:
         return False
+
+
+def _ruff_lint(test_code: str) -> tuple[bool, list[str]]:
+    """
+    Runs ruff on test_code via subprocess.
+    Returns (syntax_valid, undefined_names).
+
+    E999 = syntax error; F821 = undefined name (catches hallucinated identifiers
+    that slip past the import-plausibility check).
+    Falls back to ast.parse if ruff is not on PATH.
+    """
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+            f.write(test_code)
+            tmp = f.name
+        result = subprocess.run(
+            ["ruff", "check", "--output-format=json", "--select=F821", tmp],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        os.unlink(tmp)
+        diagnostics = json.loads(result.stdout or "[]")
+        # "invalid-syntax" = modern ruff syntax error code (replaced old E999)
+        syntax_valid = not any(d.get("code") == "invalid-syntax" for d in diagnostics)
+        # F821 messages use backticks: "Undefined name `foo`"
+        undefined_names = list({
+            d["message"].split("`")[1]
+            for d in diagnostics
+            if d.get("code") == "F821" and "`" in d.get("message", "")
+        })
+        return syntax_valid, undefined_names
+    except FileNotFoundError:
+        return _check_syntax(test_code), []
+    except Exception as exc:
+        logger.debug("ruff lint error (%s) — falling back to ast.parse", exc)
+        return _check_syntax(test_code), []
 
 
 def _extract_imports(test_code: str) -> list[str]:
@@ -90,8 +131,8 @@ class EvalAgent:
         context: ContextPayload,
         gap: CoverageGap,
     ) -> EvalResult:
-        # --- Phase 1a: Syntax check (deterministic) ---
-        syntax_valid = _check_syntax(draft.test_code)
+        # --- Phase 1a: Syntax check (ruff, falls back to ast.parse) ---
+        syntax_valid, ruff_undefined = _ruff_lint(draft.test_code)
         if not syntax_valid:
             logger.info("EvalAgent: syntax invalid for %s — routing REWRITE", gap.gap_id)
             return EvalResult(
@@ -99,12 +140,16 @@ class EvalAgent:
                 unknown_imports=[],
                 mock_complete=False,
                 assertion_score=1,
-                critique="Test code failed ast.parse(). Fix all syntax errors.",
+                critique="Test code has syntax errors. Fix all syntax errors before proceeding.",
                 route="REWRITE",
             )
 
         # --- Phase 1b: Import plausibility (deterministic) ---
         unknown_imports = _find_unknown_imports(draft.test_code, context, gap)
+        # Merge ruff F821 undefined names not already caught by import analysis
+        for name in ruff_undefined:
+            if name not in unknown_imports:
+                unknown_imports.append(name)
 
         if is_dry_run():
             logger.info("[DRY_RUN] EvalAgent — returning passing stub for %s", gap.gap_id)
