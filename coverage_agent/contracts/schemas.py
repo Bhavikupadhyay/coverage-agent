@@ -56,4 +56,5 @@ class GapResult(BaseModel):
     loops_taken: int
     phase1_scores: Optional[EvalResult]
     phase2_scores: Optional[ExecutionResult]
-    final_test_committed: bool
+    final_test_committed: bool  # True = test verified by E2B and available for download
+    test_code: Optional[str] = None  # Passing test source; populated when final_test_committed=True

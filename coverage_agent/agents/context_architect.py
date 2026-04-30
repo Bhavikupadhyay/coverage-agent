@@ -1,57 +1,70 @@
 import logging
-import os
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import litellm
 
+from coverage_agent.config import get_model, is_dry_run
 from coverage_agent.contracts.schemas import ContextPayload, CoverageGap
 from coverage_agent.context.jedi_graph import build_context
 
+if TYPE_CHECKING:
+    from coverage_agent.sandbox.e2b_runner import E2BSandbox
+
 logger = logging.getLogger(__name__)
-
-_MODEL = "gemini/gemini-2.5-flash"
-
-
-def _is_dry_run() -> bool:
-    return os.environ.get("DRY_RUN", "false").lower() == "true"
 
 
 class ContextArchitect:
     """
-    Constructs the exact subset of codebase context needed to write a test
-    for a specific coverage gap.
+    Constructs the context payload needed to write a test for a coverage gap.
 
-    In live mode: LLM decides the required graph_depth, then deterministic
-    Jedi traversal executes it via build_context().
-
-    In dry-run mode: depth is hardcoded to 1, returning the fixture payload.
+    When a sandbox is provided (live/web mode), Jedi runs inside E2B where
+    the repo already lives — no local filesystem access. When sandbox is None
+    (CLI fallback), the local jedi_graph path is used.
     """
 
-    def run(self, gap: CoverageGap, depth_override: int | None = None) -> ContextPayload:
+    def run(
+        self,
+        gap: CoverageGap,
+        depth_override: int | None = None,
+        repo_root: str = ".",
+        sandbox: "E2BSandbox | None" = None,
+    ) -> ContextPayload:
         if depth_override is not None:
             depth = depth_override
-        elif _is_dry_run():
+        elif is_dry_run():
             depth = 1
             logger.info("[DRY_RUN] ContextArchitect — using depth=1 for %s", gap.gap_id)
         else:
-            depth = self._decide_depth(gap)
+            depth = self._decide_depth(gap, repo_root=repo_root, sandbox=sandbox)
 
-        return build_context(gap.file_path, gap.target_symbol, depth=depth)
+        if sandbox is not None:
+            context_dict = sandbox.build_context(gap.file_path, gap.target_symbol, depth)
+            return ContextPayload(**context_dict)
 
-    def _decide_depth(self, gap: CoverageGap) -> int:
-        """
-        Asks the LLM what graph_depth is needed to understand the target gap.
-        Returns 0, 1, or 2. Falls back to 1 on any failure.
-        """
+        return build_context(gap.file_path, gap.target_symbol, depth=depth, repo_root=repo_root)
+
+    def _decide_depth(
+        self,
+        gap: CoverageGap,
+        repo_root: str = ".",
+        sandbox: "E2BSandbox | None" = None,
+    ) -> int:
+        """Asks the LLM what graph_depth is needed. Falls back to 1 on any failure."""
+        source_preview = "\n".join(f"line {ln}" for ln in gap.surrounding_lines[:20])
         try:
-            source_lines = Path(gap.file_path).read_text(encoding="utf-8").splitlines()
+            if sandbox is not None:
+                raw = sandbox._sandbox.files.read(f"/home/user/repo/{gap.file_path}")
+                source_lines = raw.splitlines()
+            else:
+                source_lines = (Path(repo_root) / gap.file_path).read_text(encoding="utf-8").splitlines()
             source_preview = "\n".join(
                 f"{ln}: {source_lines[ln - 1]}"
                 for ln in gap.surrounding_lines[:20]
                 if 0 < ln <= len(source_lines)
             )
         except Exception:
-            source_preview = "\n".join(f"line {ln}" for ln in gap.surrounding_lines[:20])
+            pass
 
         prompt = (
             f"You are analyzing a Python coverage gap to decide how much context is needed.\n\n"
@@ -67,7 +80,7 @@ class ContextArchitect:
         )
         try:
             response = litellm.completion(
-                model=_MODEL,
+                model=get_model(),
                 messages=[{"role": "user", "content": prompt}],
             )
             content = response.choices[0].message.content.strip()

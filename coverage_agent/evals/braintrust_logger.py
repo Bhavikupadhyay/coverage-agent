@@ -1,13 +1,9 @@
 import logging
-import os
 
+from coverage_agent.config import is_dry_run
 from coverage_agent.contracts.schemas import GapResult
 
 logger = logging.getLogger(__name__)
-
-
-def _is_dry_run() -> bool:
-    return os.environ.get("DRY_RUN", "false").lower() == "true"
 
 
 class BraintrustLogger:
@@ -28,7 +24,7 @@ class BraintrustLogger:
         self.project_name = project_name
         self._dataset = None
 
-        if _is_dry_run():
+        if is_dry_run():
             logger.info("[DRY_RUN] BraintrustLogger — no real connection will be made")
             return
 
@@ -53,7 +49,7 @@ class BraintrustLogger:
         """
         final_state = final_state or {}
 
-        if _is_dry_run():
+        if is_dry_run():
             p1 = gap_result.phase1_scores
             p2 = gap_result.phase2_scores
             logger.info(
@@ -94,7 +90,7 @@ class BraintrustLogger:
 
     def flush(self) -> None:
         """Flushes the dataset buffer. Call once after all gaps are processed."""
-        if _is_dry_run():
+        if is_dry_run():
             return
         if self._dataset:
             self._dataset.flush()

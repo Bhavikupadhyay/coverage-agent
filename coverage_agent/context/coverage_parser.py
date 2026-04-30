@@ -17,10 +17,10 @@ def _is_trivial_line(source_line: str) -> bool:
     return stripped in ("pass", "return", "return None", "...")
 
 
-def _get_surrounding_lines(file_path: str, from_line: int, to_line: int) -> list[int]:
+def _get_surrounding_lines(file_path: str, from_line: int, to_line: int, repo_root: str = ".") -> list[int]:
     """Returns the line numbers of the enclosing function body."""
     try:
-        source = Path(file_path).read_text(encoding="utf-8")
+        source = (Path(repo_root) / file_path).read_text(encoding="utf-8")
         tree = ast.parse(source)
         lines = source.splitlines()
 
@@ -40,10 +40,10 @@ def _get_surrounding_lines(file_path: str, from_line: int, to_line: int) -> list
     return list(range(start, end + 1))
 
 
-def _find_containing_symbol(file_path: str, line: int) -> str:
+def _find_containing_symbol(file_path: str, line: int, repo_root: str = ".") -> str:
     """Returns the name of the function/method containing the given line."""
     try:
-        source = Path(file_path).read_text(encoding="utf-8")
+        source = (Path(repo_root) / file_path).read_text(encoding="utf-8")
         tree = ast.parse(source)
 
         best: Optional[tuple[int, str]] = None
@@ -63,13 +63,13 @@ def _find_containing_symbol(file_path: str, line: int) -> str:
     return "unknown"
 
 
-def _is_trivial_gap(file_path: str, from_line: int, containing_symbol: str) -> bool:
+def _is_trivial_gap(file_path: str, from_line: int, containing_symbol: str, repo_root: str = ".") -> bool:
     """Filters out gaps that aren't worth testing."""
     if containing_symbol in _TRIVIAL_SYMBOLS:
         return True
 
     try:
-        lines = Path(file_path).read_text(encoding="utf-8").splitlines()
+        lines = (Path(repo_root) / file_path).read_text(encoding="utf-8").splitlines()
         if 0 < from_line <= len(lines):
             if _is_trivial_line(lines[from_line - 1]):
                 return True
@@ -79,15 +79,18 @@ def _is_trivial_gap(file_path: str, from_line: int, containing_symbol: str) -> b
     return False
 
 
-def parse_coverage(coverage_json: dict) -> list[CoverageGap]:
+def parse_coverage(coverage_json: dict, repo_root: str = ".") -> list[CoverageGap]:
     """
     Parses a coverage.py --branch --json report into a list of CoverageGap objects.
 
     Each missing branch becomes one CoverageGap. Trivial gaps (inside __init__,
     pass statements, bare returns) are filtered out.
 
-    Gap Prioritizer is responsible for filling in priority_score and refining
-    target_symbol — both are set to placeholder values here.
+    repo_root is the local path to the cloned repository. File paths in
+    coverage.json are relative to the repo root, so all file reads are
+    resolved as Path(repo_root) / file_path.
+
+    Gap Prioritizer is responsible for filling in priority_score.
     """
     gaps: list[CoverageGap] = []
     files: dict = coverage_json.get("files", {})
@@ -101,14 +104,14 @@ def parse_coverage(coverage_json: dict) -> list[CoverageGap]:
                 continue
 
             from_line, to_line = int(branch[0]), int(branch[1])
-            containing_symbol = _find_containing_symbol(file_path, from_line)
+            containing_symbol = _find_containing_symbol(file_path, from_line, repo_root)
 
-            if _is_trivial_gap(file_path, from_line, containing_symbol):
+            if _is_trivial_gap(file_path, from_line, containing_symbol, repo_root):
                 logger.debug("Skipping trivial gap %s:%d->%d", file_path, from_line, to_line)
                 continue
 
             gap_id = f"{file_path}:{from_line}->{to_line}"
-            surrounding = _get_surrounding_lines(file_path, from_line, to_line)
+            surrounding = _get_surrounding_lines(file_path, from_line, to_line, repo_root)
 
             gap = CoverageGap(
                 file_path=file_path,

@@ -1,17 +1,202 @@
 import json
 import logging
-import os
 from pathlib import Path
 
-from coverage_agent.contracts.schemas import ExecutionResult
+from coverage_agent.config import is_dry_run
+from coverage_agent.contracts.schemas import CoverageGap, ContextPayload, ExecutionResult
 
 logger = logging.getLogger(__name__)
 
 _FIXTURES_DIR = Path(__file__).parent.parent / "fixtures"
 
+# ---------------------------------------------------------------------------
+# Embedded scripts — run inside the E2B sandbox where the repo lives.
+# No local filesystem access needed.
+# ---------------------------------------------------------------------------
 
-def _is_dry_run() -> bool:
-    return os.environ.get("DRY_RUN", "false").lower() == "true"
+_COVERAGE_PARSER_SCRIPT = r"""
+import ast, json
+from pathlib import Path
+
+coverage_json = json.loads(Path("/tmp/coverage_input.json").read_text())
+repo_root = "/home/user/repo"
+
+TRIVIAL_SYMBOLS = {"__init__", "__repr__", "__str__", "__eq__", "__hash__"}
+
+def is_trivial_line(line):
+    s = line.strip()
+    return s in ("pass", "return", "return None", "...")
+
+def get_surrounding_lines(source, from_line, to_line):
+    try:
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            end = node.end_lineno or node.lineno
+            if node.lineno <= from_line <= end:
+                return list(range(node.lineno, end + 1))
+    except Exception:
+        pass
+    return list(range(max(1, from_line - 5), to_line + 6))
+
+def find_containing_symbol(source, line):
+    try:
+        tree = ast.parse(source)
+        best = None
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            end = node.end_lineno or node.lineno
+            if node.lineno <= line <= end:
+                if best is None or node.lineno > best[0]:
+                    best = (node.lineno, node.name)
+        if best:
+            return best[1]
+    except Exception:
+        pass
+    return "unknown"
+
+gaps = []
+for file_path, file_data in coverage_json.get("files", {}).items():
+    try:
+        source = (Path(repo_root) / file_path).read_text(encoding="utf-8")
+        lines = source.splitlines()
+    except Exception:
+        continue
+    for branch in file_data.get("missing_branches", []):
+        if len(branch) != 2:
+            continue
+        from_line, to_line = int(branch[0]), int(branch[1])
+        symbol = find_containing_symbol(source, from_line)
+        if symbol in TRIVIAL_SYMBOLS:
+            continue
+        if 0 < from_line <= len(lines) and is_trivial_line(lines[from_line - 1]):
+            continue
+        surrounding = get_surrounding_lines(source, from_line, to_line)
+        gaps.append({
+            "file_path": file_path,
+            "target_symbol": symbol,
+            "branch": {"from_line": from_line, "to_line": to_line},
+            "surrounding_lines": surrounding,
+            "priority_score": 0.0,
+            "gap_id": f"{file_path}:{from_line}->{to_line}",
+        })
+
+print(json.dumps(gaps))
+"""
+
+_JEDI_CONTEXT_SCRIPT = r"""
+import ast, json
+from pathlib import Path
+
+try:
+    import jedi
+except ImportError:
+    import subprocess, sys
+    subprocess.run([sys.executable, "-m", "pip", "install", "jedi", "-q"], check=True)
+    import jedi
+
+MAX_TOKENS = 15000
+
+def count_tokens(text):
+    return len(text) // 4
+
+def extract_function_source(resolved_path, target_symbol):
+    try:
+        source = Path(resolved_path).read_text(encoding="utf-8")
+        script = jedi.Script(source, path=resolved_path)
+        names = script.get_names(all_scopes=True, definitions=True)
+        for name in names:
+            if name.name == target_symbol and name.type in ("function", "class"):
+                start_line = name.line
+                lines = source.splitlines()
+                base_indent = len(lines[start_line - 1]) - len(lines[start_line - 1].lstrip())
+                func_lines = []
+                for i, line in enumerate(lines[start_line - 1:], start=start_line):
+                    if i > start_line and line.strip() and (len(line) - len(line.lstrip())) <= base_indent:
+                        break
+                    func_lines.append(line)
+                return "\n".join(func_lines)
+    except Exception:
+        pass
+    return None
+
+def extract_callees(resolved_path, target_symbol):
+    deps = {}
+    try:
+        source = Path(resolved_path).read_text(encoding="utf-8")
+        script = jedi.Script(source, path=resolved_path)
+        names = script.get_names(all_scopes=True, references=True)
+        for name in names:
+            if name.name == target_symbol:
+                continue
+            try:
+                definitions = name.goto()
+                for defn in definitions:
+                    if defn.name and defn.name not in deps:
+                        sig = defn.get_signatures()
+                        deps[defn.name] = str(sig[0]) if sig else f"# {defn.type}: {defn.name}"
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return deps
+
+args = json.loads(Path("/tmp/jedi_input.json").read_text())
+file_path = args["file_path"]
+target_symbol = args["target_symbol"]
+depth = args["depth"]
+repo_root = "/home/user/repo"
+resolved = str(Path(repo_root) / file_path)
+
+fallback_used = False
+primary_code = extract_function_source(resolved, target_symbol)
+if primary_code is None:
+    try:
+        primary_code = Path(resolved).read_text(encoding="utf-8")
+    except Exception:
+        primary_code = f"# Could not read {resolved}"
+    fallback_used = True
+
+dependencies = {}
+depth_used = 0
+
+if depth >= 1 and not fallback_used:
+    tokens = count_tokens(primary_code)
+    for name, source in extract_callees(resolved, target_symbol).items():
+        t = count_tokens(source)
+        if tokens + t > MAX_TOKENS:
+            break
+        dependencies[name] = source
+        tokens += t
+    depth_used = 1
+
+if depth >= 2 and not fallback_used and dependencies:
+    depth2 = {}
+    for callee in list(dependencies):
+        for name, source in extract_callees(resolved, callee).items():
+            if name in dependencies or name in depth2:
+                continue
+            t = count_tokens(source)
+            if tokens + t > MAX_TOKENS:
+                break
+            depth2[name] = source
+            tokens += t
+    if depth2:
+        dependencies.update(depth2)
+        depth_used = 2
+
+tokens_used = count_tokens(primary_code) + sum(count_tokens(v) for v in dependencies.values())
+
+print(json.dumps({
+    "primary_code": primary_code,
+    "dependencies_code": dependencies,
+    "graph_depth_used": depth_used,
+    "tokens_used": tokens_used,
+    "fallback_used": fallback_used,
+}))
+"""
 
 
 class E2BSandbox:
@@ -35,7 +220,7 @@ class E2BSandbox:
         self._sandbox = None
         self._paused_id: str | None = None
 
-        if _is_dry_run():
+        if is_dry_run():
             logger.info("[DRY_RUN] E2BSandbox.__init__ — skipping real sandbox creation for %s", repo_path)
             return
 
@@ -50,7 +235,7 @@ class E2BSandbox:
 
     def _ensure_active(self) -> None:
         """Resumes the sandbox if it was paused. No-op in dry-run or if already active."""
-        if _is_dry_run() or self._sandbox is not None:
+        if is_dry_run() or self._sandbox is not None:
             return
         if self._paused_id is None:
             raise RuntimeError("Sandbox is not active and has no paused ID to resume from")
@@ -58,14 +243,14 @@ class E2BSandbox:
         self._paused_id = None
 
     def install_dependencies(self) -> None:
-        """Runs pip install -e .[dev] inside the sandbox. Called once per repo."""
-        if _is_dry_run():
+        """Runs pip install inside the sandbox. Called once per repo."""
+        if is_dry_run():
             logger.info("[DRY_RUN] install_dependencies — skipping")
             return
 
         self._ensure_active()
         result = self._sandbox.commands.run(
-            "pip install -e '.[dev]' pytest pytest-cov coverage -q",
+            "pip install -e '.[dev]' pytest pytest-cov coverage jedi -q",
             cwd="/home/user/repo",
             timeout=300,
         )
@@ -80,7 +265,7 @@ class E2BSandbox:
         Runs the full test suite with branch coverage once per repo.
         Returns the parsed coverage.json dict.
         """
-        if _is_dry_run():
+        if is_dry_run():
             logger.info("[DRY_RUN] run_coverage_baseline — returning fixture")
             fixture_path = _FIXTURES_DIR / "sample_coverage.json"
             return json.loads(fixture_path.read_text(encoding="utf-8"))
@@ -121,7 +306,7 @@ class E2BSandbox:
         whether the specific target branch was newly covered, then deletes the
         test file. Returns an ExecutionResult.
         """
-        if _is_dry_run():
+        if is_dry_run():
             logger.info("[DRY_RUN] run_test — returning fixture ExecutionResult for gap %s", gap_id)
             return ExecutionResult(
                 execution_success=True,
@@ -196,7 +381,7 @@ class E2BSandbox:
 
     def upload_repo(self, local_path: str) -> None:
         """Uploads a local repo directory to /home/user/repo in the sandbox. Skips .git, __pycache__, *.pyc."""
-        if _is_dry_run():
+        if is_dry_run():
             logger.info("[DRY_RUN] upload_repo — skipping")
             return
         self._ensure_active()
@@ -221,7 +406,7 @@ class E2BSandbox:
 
     def setup_repo(self, repo_url_or_path: str) -> None:
         """Clones a repo URL into /home/user/repo, or uploads a local path to /home/user/repo."""
-        if _is_dry_run():
+        if is_dry_run():
             logger.info("[DRY_RUN] setup_repo — skipping")
             return
         self._ensure_active()
@@ -241,7 +426,7 @@ class E2BSandbox:
         Pauses the sandbox to stop billing during LLM calls.
         Returns the sandbox_id needed to resume. Sets internal sandbox to None.
         """
-        if _is_dry_run():
+        if is_dry_run():
             logger.info("[DRY_RUN] pause — skipping")
             return "dry-run-sandbox-id"
 
@@ -254,7 +439,7 @@ class E2BSandbox:
 
     def resume(self, sandbox_id: str) -> None:
         """Resumes a previously paused sandbox by its ID."""
-        if _is_dry_run():
+        if is_dry_run():
             logger.info("[DRY_RUN] resume — skipping")
             return
 
@@ -262,9 +447,61 @@ class E2BSandbox:
         self._sandbox = Sandbox.connect(sandbox_id)
         logger.info("E2B sandbox resumed (id=%s)", sandbox_id)
 
+    def parse_gaps(self, coverage_json: dict) -> list[CoverageGap]:
+        """Runs coverage gap parsing inside E2B. Returns CoverageGap list with priority_score=0."""
+        if is_dry_run():
+            logger.info("[DRY_RUN] parse_gaps — returning fixture gaps")
+            from coverage_agent.context.coverage_parser import parse_coverage
+            fixture_path = _FIXTURES_DIR / "sample_coverage.json"
+            fixture_json = json.loads(fixture_path.read_text(encoding="utf-8"))
+            return parse_coverage(fixture_json, repo_root=".")
+
+        self._ensure_active()
+        self._sandbox.files.write("/tmp/coverage_input.json", json.dumps(coverage_json))
+        self._sandbox.files.write("/tmp/parse_gaps.py", _COVERAGE_PARSER_SCRIPT)
+        result = self._sandbox.commands.run(
+            "python /tmp/parse_gaps.py",
+            cwd="/home/user/repo",
+            timeout=60,
+        )
+        if result.exit_code != 0:
+            raise RuntimeError(f"parse_gaps script failed (exit {result.exit_code}):\n{result.stderr}")
+        gaps_data = json.loads(result.stdout)
+        return [CoverageGap(**g) for g in gaps_data]
+
+    def build_context(self, file_path: str, target_symbol: str, depth: int) -> dict:
+        """Runs Jedi context building inside E2B. Returns a dict matching ContextPayload fields."""
+        if is_dry_run():
+            logger.info("[DRY_RUN] build_context — returning fixture context")
+            fixture_path = _FIXTURES_DIR / "sample_context.json"
+            return json.loads(fixture_path.read_text(encoding="utf-8"))
+
+        self._ensure_active()
+        args = {"file_path": file_path, "target_symbol": target_symbol, "depth": depth}
+        self._sandbox.files.write("/tmp/jedi_input.json", json.dumps(args))
+        self._sandbox.files.write("/tmp/jedi_context.py", _JEDI_CONTEXT_SCRIPT)
+        result = self._sandbox.commands.run(
+            "python /tmp/jedi_context.py",
+            cwd="/home/user/repo",
+            timeout=60,
+        )
+        if result.exit_code != 0:
+            logger.warning(
+                "build_context script failed for %s:%s (exit %d) — returning empty context",
+                file_path, target_symbol, result.exit_code,
+            )
+            return {
+                "primary_code": f"# Could not read {file_path}:{target_symbol}",
+                "dependencies_code": {},
+                "graph_depth_used": 0,
+                "tokens_used": 0,
+                "fallback_used": True,
+            }
+        return json.loads(result.stdout)
+
     def close(self) -> None:
         """Kills the E2B sandbox VM. Called by Orchestrator after all gaps are done."""
-        if _is_dry_run():
+        if is_dry_run():
             logger.info("[DRY_RUN] close — skipping")
             return
 
