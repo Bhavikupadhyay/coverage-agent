@@ -6,5 +6,6 @@
   },
   "graph_depth_used": 1,
   "tokens_used": 412,
-  "fallback_used": false
+  "fallback_used": false,
+  "branch_condition_hint": "'digest' in s_auth.lower() and num_401_calls < 2"
 }

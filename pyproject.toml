@@ -14,7 +14,6 @@ dependencies = [
     "e2b>=0.17",
     "braintrust>=0.0.100",
     "coverage[toml]>=7.0",
-    "gradio>=5.0",
     "fastapi>=0.111",
     "uvicorn>=0.30",
 ]
@@ -42,3 +41,11 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# smoke_*.py files require live API keys; exclude from default collection.
+# Run them explicitly: pytest tests/smoke_groq.py
+python_files = ["test_*.py"]
+norecursedirs = [".git", ".venv", ".local", "node_modules"]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+]
