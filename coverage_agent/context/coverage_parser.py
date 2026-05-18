@@ -1,7 +1,8 @@
 import ast
+import fnmatch
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 from coverage_agent.contracts.schemas import BranchGap, CoverageGap
 
@@ -11,16 +12,62 @@ logger = logging.getLogger(__name__)
 _TRIVIAL_SYMBOLS = {"__init__", "__repr__", "__str__", "__eq__", "__hash__"}
 
 
+# ---------------------------------------------------------------------------
+# Ignore pattern engine (gitignore / dockerignore semantics)
+# ---------------------------------------------------------------------------
+
+def load_ignore_patterns(path: str) -> list[str]:
+    """Reads a gitignore-style file and returns a list of non-empty, non-comment lines."""
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return []
+    return [ln.strip() for ln in lines if ln.strip() and not ln.strip().startswith("#")]
+
+
+def _file_matches_patterns(file_path: str, patterns: Sequence[str]) -> bool:
+    """
+    Returns True if file_path should be excluded based on any pattern in patterns.
+
+    Matching rules (gitignore-compatible subset):
+    - Patterns ending with `/` match any file under that directory.
+    - Patterns containing `/` (other than a trailing one) are anchored to the
+      repo root and matched against the full relative path.
+    - All other patterns are unanchored and matched against every path component
+      (directory name or filename) using fnmatch glob syntax.
+    """
+    fp = file_path.replace("\\", "/")
+    parts = fp.split("/")
+
+    for raw in patterns:
+        is_dir = raw.endswith("/")
+        pat = raw.rstrip("/")
+
+        if "/" in pat:
+            # Anchored: match full relative path or path prefix for dir patterns
+            if fnmatch.fnmatch(fp, pat):
+                return True
+            if is_dir and (fp.startswith(pat + "/") or fnmatch.fnmatch(fp, pat + "/*")):
+                return True
+        else:
+            # Unanchored: match against any individual component of the path
+            for part in parts:
+                if fnmatch.fnmatch(part, pat):
+                    return True
+
+    return False
+
+
 def _is_trivial_line(source_line: str) -> bool:
     """Returns True for lines that represent no meaningful logic."""
     stripped = source_line.strip()
     return stripped in ("pass", "return", "return None", "...")
 
 
-def _get_surrounding_lines(file_path: str, from_line: int, to_line: int) -> list[int]:
+def _get_surrounding_lines(file_path: str, from_line: int, to_line: int, repo_root: str = ".") -> list[int]:
     """Returns the line numbers of the enclosing function body."""
     try:
-        source = Path(file_path).read_text(encoding="utf-8")
+        source = (Path(repo_root) / file_path).read_text(encoding="utf-8")
         tree = ast.parse(source)
         lines = source.splitlines()
 
@@ -40,10 +87,10 @@ def _get_surrounding_lines(file_path: str, from_line: int, to_line: int) -> list
     return list(range(start, end + 1))
 
 
-def _find_containing_symbol(file_path: str, line: int) -> str:
+def _find_containing_symbol(file_path: str, line: int, repo_root: str = ".") -> str:
     """Returns the name of the function/method containing the given line."""
     try:
-        source = Path(file_path).read_text(encoding="utf-8")
+        source = (Path(repo_root) / file_path).read_text(encoding="utf-8")
         tree = ast.parse(source)
 
         best: Optional[tuple[int, str]] = None
@@ -63,13 +110,13 @@ def _find_containing_symbol(file_path: str, line: int) -> str:
     return "unknown"
 
 
-def _is_trivial_gap(file_path: str, from_line: int, containing_symbol: str) -> bool:
+def _is_trivial_gap(file_path: str, from_line: int, containing_symbol: str, repo_root: str = ".") -> bool:
     """Filters out gaps that aren't worth testing."""
     if containing_symbol in _TRIVIAL_SYMBOLS:
         return True
 
     try:
-        lines = Path(file_path).read_text(encoding="utf-8").splitlines()
+        lines = (Path(repo_root) / file_path).read_text(encoding="utf-8").splitlines()
         if 0 < from_line <= len(lines):
             if _is_trivial_line(lines[from_line - 1]):
                 return True
@@ -79,20 +126,35 @@ def _is_trivial_gap(file_path: str, from_line: int, containing_symbol: str) -> b
     return False
 
 
-def parse_coverage(coverage_json: dict) -> list[CoverageGap]:
+def parse_coverage(
+    coverage_json: dict,
+    repo_root: str = ".",
+    ignore_patterns: Sequence[str] = (),
+) -> list[CoverageGap]:
     """
     Parses a coverage.py --branch --json report into a list of CoverageGap objects.
 
     Each missing branch becomes one CoverageGap. Trivial gaps (inside __init__,
     pass statements, bare returns) are filtered out.
 
-    Gap Prioritizer is responsible for filling in priority_score and refining
-    target_symbol — both are set to placeholder values here.
+    repo_root is the local path to the cloned repository. File paths in
+    coverage.json are relative to the repo root, so all file reads are
+    resolved as Path(repo_root) / file_path.
+
+    ignore_patterns is an optional list of gitignore-style patterns. Files
+    matching any pattern are excluded entirely. Pass the result of
+    load_ignore_patterns() here.
+
+    Gap Prioritizer is responsible for filling in priority_score.
     """
     gaps: list[CoverageGap] = []
     files: dict = coverage_json.get("files", {})
 
     for file_path, file_data in files.items():
+        if ignore_patterns and _file_matches_patterns(file_path, ignore_patterns):
+            logger.debug("Ignoring %s (matched ignore pattern)", file_path)
+            continue
+
         missing_branches: list = file_data.get("missing_branches", [])
 
         for branch in missing_branches:
@@ -101,14 +163,14 @@ def parse_coverage(coverage_json: dict) -> list[CoverageGap]:
                 continue
 
             from_line, to_line = int(branch[0]), int(branch[1])
-            containing_symbol = _find_containing_symbol(file_path, from_line)
+            containing_symbol = _find_containing_symbol(file_path, from_line, repo_root)
 
-            if _is_trivial_gap(file_path, from_line, containing_symbol):
+            if _is_trivial_gap(file_path, from_line, containing_symbol, repo_root):
                 logger.debug("Skipping trivial gap %s:%d->%d", file_path, from_line, to_line)
                 continue
 
             gap_id = f"{file_path}:{from_line}->{to_line}"
-            surrounding = _get_surrounding_lines(file_path, from_line, to_line)
+            surrounding = _get_surrounding_lines(file_path, from_line, to_line, repo_root)
 
             gap = CoverageGap(
                 file_path=file_path,
