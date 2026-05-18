@@ -17,6 +17,12 @@ env/
 # Environment / secrets
 .env
 
+# Local run state (SQLite, caches)
+.local/
+
+# Legacy DB location (kept ignored in case it lingers in checkouts)
+coverage_agent_runs.db
+
 # Coverage
 .coverage
 coverage.json
