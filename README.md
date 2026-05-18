@@ -1,18 +1,8 @@
----
-title: CoverageAgent
-emoji: 🧪
-colorFrom: blue
-colorTo: green
-sdk: docker
-app_file: app.py
-pinned: false
----
-
 # CoverageAgent
 
 A multi-agent pipeline that finds uncovered Python branches in any GitHub repo, writes targeted pytest tests for each one, and verifies every test in an isolated sandbox before handing it back to you.
 
-![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue) ![LangGraph](https://img.shields.io/badge/orchestration-LangGraph-orange) ![Groq](https://img.shields.io/badge/LLM-Groq-purple) ![E2B](https://img.shields.io/badge/sandbox-E2B-green) ![Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-lightgrey)
+![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue) ![7-agent pipeline](https://img.shields.io/badge/agents-7--agent%20pipeline-5B21D3) ![branch verified](https://img.shields.io/badge/coverage-branch%20verified-22C55E) ![E2B Firecracker](https://img.shields.io/badge/sandbox-E2B%20Firecracker-F59E0B) ![Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-lightgrey)
 
 ## What it does
 
