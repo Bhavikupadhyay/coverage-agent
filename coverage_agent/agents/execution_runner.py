@@ -1,9 +1,21 @@
 import logging
+from typing import Any
 
+from coverage_agent.credentials import Credentials
 from coverage_agent.contracts.schemas import CoverageGap, DraftTest, ExecutionResult
-from coverage_agent.sandbox.e2b_runner import E2BSandbox
 
 logger = logging.getLogger(__name__)
+
+_SYSTEM_ERROR_PATTERNS: tuple[str, ...] = (
+    "Can't append to data files in parallel mode",
+    "ModuleNotFoundError",
+    "coverage: error:",
+    "No module named",
+)
+
+
+def _is_system_error(stderr: str) -> bool:
+    return any(p in (stderr or "") for p in _SYSTEM_ERROR_PATTERNS)
 
 
 class ExecutionRunner:
@@ -15,11 +27,14 @@ class ExecutionRunner:
     is marked flaky and skipped (execution_success=False, flaky=True).
     """
 
+    def __init__(self, credentials: Credentials) -> None:
+        self.creds = credentials
+
     def run(
         self,
         draft: DraftTest,
         gap: CoverageGap,
-        sandbox: E2BSandbox,
+        sandbox: Any,
         baseline_coverage: dict | None = None,
     ) -> ExecutionResult:
         baseline_coverage = baseline_coverage or {}
@@ -39,7 +54,8 @@ class ExecutionRunner:
         first = sandbox.run_test(draft.test_code, **run_kwargs)
 
         if not first.execution_success:
-            # Failed on first attempt — return immediately, no flakiness check needed
+            if _is_system_error(first.stderr_trace):
+                return first.model_copy(update={"is_system_error": True})
             return first
 
         # Re-run twice to detect flakiness
