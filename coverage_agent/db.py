@@ -1,8 +1,28 @@
 import json
+import os
 import sqlite3
 from pathlib import Path
 
-_DEFAULT_DB = Path(__file__).parent.parent / "coverage_agent_runs.db"
+_PROJECT_ROOT = Path(__file__).parent.parent
+_LOCAL_DIR = _PROJECT_ROOT / ".local"
+
+
+def _default_db_path() -> Path:
+    """Returns the SQLite file path. Honors COVERAGE_AGENT_DB env var.
+
+    Files live in `.local/` so they stay out of the repo and out of accidental
+    git stages. The directory is created on first use.
+    """
+    override = os.environ.get("COVERAGE_AGENT_DB", "").strip()
+    if override:
+        path = Path(override)
+    else:
+        path = _LOCAL_DIR / "coverage_agent_runs.db"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+_DEFAULT_DB = _default_db_path()
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
