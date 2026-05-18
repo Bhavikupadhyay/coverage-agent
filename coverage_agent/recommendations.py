@@ -1,4 +1,23 @@
-from coverage_agent.contracts.schemas import GapResult
+from coverage_agent.contracts.schemas import ContextPayload, CoverageGap, ExecutionResult, GapResult
+
+
+def gap_branch_recommendation(
+    gap: CoverageGap,
+    ctx: ContextPayload | None,
+    p2: ExecutionResult | None,
+) -> str:
+    """Actionable text when pytest passed but the target branch is still missing from coverage."""
+    if p2 is None or not p2.execution_success or p2.target_branch_hit:
+        return ""
+    hint = ctx.branch_condition_hint if ctx else None
+    core = (
+        f"Pytest exited 0, but coverage did not record branch "
+        f"{gap.branch.from_line}->{gap.branch.to_line} in `{gap.file_path}` "
+        "in executed_branches. A commit requires that edge."
+    )
+    if hint:
+        return core + f" Condition hint: `{hint}`. Adjust inputs or mocks so this branch runs."
+    return core + " Re-read the implementation and change inputs until the branch executes."
 
 
 def generate(scorecard: dict, results: list[GapResult]) -> list[str]:
@@ -18,13 +37,13 @@ def generate(scorecard: dict, results: list[GapResult]) -> list[str]:
 
     if hit_rate == 0.0:
         recs.append(
-            "No branches were hit. Verify the repo has a working test suite — "
-            "if pytest fails during baseline, coverage data will be empty."
+            "No commits with branch proof. Check sandbox stderr per gap — "
+            "pytest must pass and coverage must list the target branch in executed_branches."
         )
     elif hit_rate < 0.5:
         recs.append(
-            f"Branch hit rate is {hit_rate_str}. Consider switching to gemini-2.5-pro "
-            "for stronger reasoning, or raising the loop limit to 5 in pipeline.py."
+            f"Branch proof rate is {hit_rate_str}. Try a stronger reasoning model, "
+            "or inspect per-gap 'What to try next' — inputs often miss the branch condition."
         )
 
     if skipped > 0:
@@ -42,9 +61,9 @@ def generate(scorecard: dict, results: list[GapResult]) -> list[str]:
 
     if avg_loops > 2.0:
         recs.append(
-            f"High average loop count ({avg_loops:.1f}). Check Braintrust dataset "
-            "for patterns in eval_agent critique — likely a mock completeness or "
-            "assertion quality issue."
+            f"High average loop count ({avg_loops:.1f}). Review per-gap recommendations "
+            "and stderr — common causes are wrong mocks, wrong inputs for the branch "
+            "condition, or coverage not tracing the package under test."
         )
 
     return recs
