@@ -1,7 +1,8 @@
 import ast
+import fnmatch
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 from coverage_agent.contracts.schemas import BranchGap, CoverageGap
 
@@ -9,6 +10,52 @@ logger = logging.getLogger(__name__)
 
 # Trivial symbols that are not worth targeting
 _TRIVIAL_SYMBOLS = {"__init__", "__repr__", "__str__", "__eq__", "__hash__"}
+
+
+# ---------------------------------------------------------------------------
+# Ignore pattern engine (gitignore / dockerignore semantics)
+# ---------------------------------------------------------------------------
+
+def load_ignore_patterns(path: str) -> list[str]:
+    """Reads a gitignore-style file and returns a list of non-empty, non-comment lines."""
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return []
+    return [ln.strip() for ln in lines if ln.strip() and not ln.strip().startswith("#")]
+
+
+def _file_matches_patterns(file_path: str, patterns: Sequence[str]) -> bool:
+    """
+    Returns True if file_path should be excluded based on any pattern in patterns.
+
+    Matching rules (gitignore-compatible subset):
+    - Patterns ending with `/` match any file under that directory.
+    - Patterns containing `/` (other than a trailing one) are anchored to the
+      repo root and matched against the full relative path.
+    - All other patterns are unanchored and matched against every path component
+      (directory name or filename) using fnmatch glob syntax.
+    """
+    fp = file_path.replace("\\", "/")
+    parts = fp.split("/")
+
+    for raw in patterns:
+        is_dir = raw.endswith("/")
+        pat = raw.rstrip("/")
+
+        if "/" in pat:
+            # Anchored: match full relative path or path prefix for dir patterns
+            if fnmatch.fnmatch(fp, pat):
+                return True
+            if is_dir and (fp.startswith(pat + "/") or fnmatch.fnmatch(fp, pat + "/*")):
+                return True
+        else:
+            # Unanchored: match against any individual component of the path
+            for part in parts:
+                if fnmatch.fnmatch(part, pat):
+                    return True
+
+    return False
 
 
 def _is_trivial_line(source_line: str) -> bool:
@@ -79,7 +126,11 @@ def _is_trivial_gap(file_path: str, from_line: int, containing_symbol: str, repo
     return False
 
 
-def parse_coverage(coverage_json: dict, repo_root: str = ".") -> list[CoverageGap]:
+def parse_coverage(
+    coverage_json: dict,
+    repo_root: str = ".",
+    ignore_patterns: Sequence[str] = (),
+) -> list[CoverageGap]:
     """
     Parses a coverage.py --branch --json report into a list of CoverageGap objects.
 
@@ -90,12 +141,20 @@ def parse_coverage(coverage_json: dict, repo_root: str = ".") -> list[CoverageGa
     coverage.json are relative to the repo root, so all file reads are
     resolved as Path(repo_root) / file_path.
 
+    ignore_patterns is an optional list of gitignore-style patterns. Files
+    matching any pattern are excluded entirely. Pass the result of
+    load_ignore_patterns() here.
+
     Gap Prioritizer is responsible for filling in priority_score.
     """
     gaps: list[CoverageGap] = []
     files: dict = coverage_json.get("files", {})
 
     for file_path, file_data in files.items():
+        if ignore_patterns and _file_matches_patterns(file_path, ignore_patterns):
+            logger.debug("Ignoring %s (matched ignore pattern)", file_path)
+            continue
+
         missing_branches: list = file_data.get("missing_branches", [])
 
         for branch in missing_branches:

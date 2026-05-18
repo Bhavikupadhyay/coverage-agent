@@ -1,3 +1,28 @@
+"""
+EvalAgent — deterministic pre-execution gate.
+
+The sandbox is the ground truth for "does this test work." EvalAgent's only
+remaining job is to catch the cheap, obvious failures before we pay for a
+sandbox round-trip:
+
+  1. Syntax validity (ruff, falls back to ast.parse)
+  2. Import plausibility (ast + context payload + ruff F821)
+
+That's it. No LLM call. No assertion-quality scoring. No mock-completeness
+LLM. Those were forms of judgment that the assertion-quality LLM consistently
+got wrong on `psf/requests` benchmarks — they were the source of v3's
+false-positive 5/5 scores on tests that crashed at runtime.
+
+By design, this means well-formed-but-semantically-wrong tests will reach
+the sandbox. That's intentional: the sandbox can tell us they crashed in a
+way the LLM cannot, and the new execution_runner → test_writer retry edge
+in pipeline.py uses that stderr as the next critique.
+
+Strictness now lives on Credentials (`should_commit`, `max_retry_loops`) and
+controls the commit gate after execution, not the LLM gate before it.
+"""
+from __future__ import annotations
+
 import ast
 import json
 import logging
@@ -7,14 +32,11 @@ import sys
 import tempfile
 from pathlib import Path
 
-import litellm
-
-from coverage_agent.config import get_model, is_dry_run
+from coverage_agent.credentials import Credentials
 from coverage_agent.contracts.schemas import ContextPayload, CoverageGap, DraftTest, EvalResult
 
 logger = logging.getLogger(__name__)
 
-# Standard library top-level module names (Python 3.11)
 _STDLIB_MODULES = set(sys.stdlib_module_names)
 
 
@@ -31,9 +53,9 @@ def _ruff_lint(test_code: str) -> tuple[bool, list[str]]:
     Runs ruff on test_code via subprocess.
     Returns (syntax_valid, undefined_names).
 
-    E999 = syntax error; F821 = undefined name (catches hallucinated identifiers
-    that slip past the import-plausibility check).
-    Falls back to ast.parse if ruff is not on PATH.
+    F821 = undefined name (catches hallucinated identifiers that slip past
+    the import-plausibility check). Falls back to ast.parse if ruff isn't
+    on PATH.
     """
     try:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
@@ -47,7 +69,6 @@ def _ruff_lint(test_code: str) -> tuple[bool, list[str]]:
         )
         os.unlink(tmp)
         diagnostics = json.loads(result.stdout or "[]")
-        # "invalid-syntax" = modern ruff syntax error code (replaced old E999)
         syntax_valid = not any(d.get("code") == "invalid-syntax" for d in diagnostics)
         # F821 messages use backticks: "Undefined name `foo`"
         undefined_names = list({
@@ -92,17 +113,27 @@ def _find_unknown_imports(
     - pytest / unittest / mock (universal test utilities)
     - The top-level package of the file under test (e.g. "requests" from "requests/auth.py")
     - Module roots extracted from dependency keys (e.g. "re" from "re.compile")
+    - Top-level imports appearing in context.primary_code (the excerpt shown to the writer)
     """
     imported = _extract_imports(test_code)
 
     # Target package root: "requests/auth.py" → "requests"
-    target_pkg = Path(gap.file_path).parts[0].replace(".py", "") if gap.file_path else ""
-    # Module roots from dependency names: "re.compile" → "re", "extract_cookies_to_jar" → itself
+    # Skip generic src-layout prefixes: "src/requests/auth.py" → "requests"
+    _SRC_DIRS = {"src", "lib", "python", "source", "packages", "pkg"}
+    _parts = Path(gap.file_path).parts if gap.file_path else ()
+    target_pkg = next(
+        (p.replace(".py", "") for p in _parts if p not in _SRC_DIRS and not p.startswith(".")),
+        _parts[0].replace(".py", "") if _parts else "",
+    )
     dep_module_roots = {k.split(".")[0] for k in context.dependencies_code}
 
     known = _STDLIB_MODULES | {"pytest", "unittest", "mock"} | dep_module_roots
     if target_pkg:
         known.add(target_pkg)
+    # Imports already used in the excerpted target code are safe to use in tests
+    # (e.g. `certifi` in requests/certs.py) even when Jedi depth=0 omitted them
+    # from dependencies_code.
+    known |= set(_extract_imports(context.primary_code))
 
     unknown = []
     for mod in imported:
@@ -111,19 +142,30 @@ def _find_unknown_imports(
     return unknown
 
 
+# Constant filled into EvalResult.assertion_score so the schema (which still
+# requires 1..=5) doesn't need to change. The number itself is meaningless
+# now — the field is a vestige of the old LLM-gate design. The sandbox tells
+# us what we actually care about.
+_NEUTRAL_ASSERTION_SCORE = 3
+
+
 class EvalAgent:
     """
-    Adversarially scores a DraftTest before the expensive E2B execution step.
+    Deterministic pre-execution gate. Catches syntax errors and hallucinated
+    imports before we pay for an E2B round-trip. Everything else routes to
+    EXECUTE and lets the sandbox tell us the truth.
 
-    Phase 1 evals:
-      1. Syntax validity (deterministic)
-      2. Import plausibility (deterministic)
-      3. Mock completeness (LLM)
-      4. Assertion quality (LLM, 1-5)
+    Routes:
+      - REWRITE        — syntax error (ast.parse / ruff `invalid-syntax`)
+      - RECONTEXTUALIZE — unknown imports / undefined names that look like missing context
+      - EXECUTE        — clean syntactically, defer semantic judgment to the sandbox
 
-    In dry-run mode, all LLM checks are stubbed with passing scores and
-    route=EXECUTE.
+    In offline mode, route=EXECUTE with passing scores so the full pipeline
+    can be exercised in tests without an LLM or sandbox.
     """
+
+    def __init__(self, credentials: Credentials) -> None:
+        self.creds = credentials
 
     def run(
         self,
@@ -131,7 +173,7 @@ class EvalAgent:
         context: ContextPayload,
         gap: CoverageGap,
     ) -> EvalResult:
-        # --- Phase 1a: Syntax check (ruff, falls back to ast.parse) ---
+        # --- 1. Syntax check (ruff, falls back to ast.parse) ---
         syntax_valid, ruff_undefined = _ruff_lint(draft.test_code)
         if not syntax_valid:
             logger.info("EvalAgent: syntax invalid for %s — routing REWRITE", gap.gap_id)
@@ -144,133 +186,46 @@ class EvalAgent:
                 route="REWRITE",
             )
 
-        # --- Phase 1b: Import plausibility (deterministic) ---
+        # --- 2. Import plausibility (deterministic) ---
         unknown_imports = _find_unknown_imports(draft.test_code, context, gap)
         # Merge ruff F821 undefined names not already caught by import analysis
         for name in ruff_undefined:
             if name not in unknown_imports:
                 unknown_imports.append(name)
 
-        if is_dry_run():
-            logger.info("[DRY_RUN] EvalAgent — returning passing stub for %s", gap.gap_id)
+        if unknown_imports:
+            critique = (
+                f"Unknown imports / undefined names detected: {unknown_imports}. "
+                "These do not appear in the context payload or stdlib. "
+                "Either remove them or request more context."
+            )
+            logger.info(
+                "EvalAgent: gap=%s unknown_imports=%s → RECONTEXTUALIZE",
+                gap.gap_id, unknown_imports,
+            )
             return EvalResult(
                 syntax_valid=True,
                 unknown_imports=unknown_imports,
                 mock_complete=True,
-                assertion_score=4,
-                critique="",
-                route="EXECUTE",
+                assertion_score=_NEUTRAL_ASSERTION_SCORE,
+                critique=critique,
+                route="RECONTEXTUALIZE",
             )
 
-        # --- Phase 1c: LLM scoring ---
-        mock_complete, mock_critique = self._check_mock_completeness(draft, context, gap)
-        assertion_score, assertion_critique = self._score_assertions(draft, gap)
-
-        # Combine critiques
-        critique_parts = []
-        if mock_critique:
-            critique_parts.append(mock_critique)
-        if assertion_critique:
-            critique_parts.append(assertion_critique)
-        if unknown_imports:
-            critique_parts.append(
-                f"Unknown imports detected: {unknown_imports}. "
-                "These are not in the context payload — verify they are real."
-            )
-
-        critique = " ".join(critique_parts)
-
-        # --- Routing logic ---
-        if unknown_imports:
-            route = "RECONTEXTUALIZE"
-        elif assertion_score < 3 or not mock_complete:
-            route = "REWRITE"
+        # --- 3. Everything else: defer to sandbox ---
+        # The sandbox can tell us whether the test runs, whether assertions
+        # pass, whether the target branch fires. An LLM cannot do any of
+        # that reliably and was the source of v3's false-positive 5/5 scores.
+        if self.creds.is_offline:
+            logger.info("[OFFLINE] EvalAgent — routing EXECUTE for %s", gap.gap_id)
         else:
-            route = "EXECUTE"
-
-        logger.info(
-            "EvalAgent: gap=%s syntax=OK mocks=%s assert_score=%d unknown_imports=%s → %s",
-            gap.gap_id,
-            mock_complete,
-            assertion_score,
-            unknown_imports,
-            route,
-        )
+            logger.info("EvalAgent: gap=%s syntax=OK imports=OK → EXECUTE", gap.gap_id)
 
         return EvalResult(
             syntax_valid=True,
-            unknown_imports=unknown_imports,
-            mock_complete=mock_complete,
-            assertion_score=assertion_score,
-            critique=critique,
-            route=route,
+            unknown_imports=[],
+            mock_complete=True,
+            assertion_score=_NEUTRAL_ASSERTION_SCORE,
+            critique="",
+            route="EXECUTE",
         )
-
-    def _check_mock_completeness(
-        self,
-        draft: DraftTest,
-        context: ContextPayload,
-        gap: CoverageGap,
-    ) -> tuple[bool, str]:
-        deps_summary = ", ".join(context.dependencies_code.keys()) or "none"
-        prompt = (
-            f"Review this pytest test for the function `{gap.target_symbol}` "
-            f"in `{gap.file_path}`.\n\n"
-            f"Known external dependencies: {deps_summary}\n\n"
-            f"Test code:\n```python\n{draft.test_code}\n```\n\n"
-            "Does the test mock all external IO, network, filesystem, or database calls "
-            "that appear in the function under test?\n\n"
-            "Respond with:\n"
-            "PASS\n"
-            "or:\n"
-            "FAIL: <brief explanation of which mocks are missing>"
-        )
-        try:
-            response = litellm.completion(
-                model=get_model(),
-                messages=[{"role": "user", "content": prompt}],
-            )
-            content = response.choices[0].message.content.strip()
-            if content.upper().startswith("PASS"):
-                return True, ""
-            critique = content[5:].strip() if content.upper().startswith("FAIL") else content
-            return False, f"Mock completeness: {critique}"
-        except Exception as exc:
-            logger.warning("Mock completeness LLM check failed (%s) — defaulting to PASS", exc)
-            return True, ""
-
-    def _score_assertions(
-        self,
-        draft: DraftTest,
-        gap: CoverageGap,
-    ) -> tuple[int, str]:
-        prompt = (
-            f"Score the assertion quality of this pytest test (1-5).\n\n"
-            f"Target: function `{gap.target_symbol}`, "
-            f"branch {gap.branch.from_line} -> {gap.branch.to_line}\n\n"
-            f"Test code:\n```python\n{draft.test_code}\n```\n\n"
-            "Scoring rubric:\n"
-            "  1 = only trivial assertions like `assert True` or `assert result is not None`\n"
-            "  2 = checks type or basic non-None result\n"
-            "  3 = checks a specific return value or a single meaningful side effect\n"
-            "  4 = checks return value AND a side effect or exception type\n"
-            "  5 = rigorously asserts specific return values, side effects, or exception "
-            "types and mock call counts\n\n"
-            "Respond with exactly two lines:\n"
-            "Line 1: a single integer between 1 and 5\n"
-            "Line 2: one sentence of feedback if the score is 3 or below, otherwise leave it blank"
-        )
-        try:
-            response = litellm.completion(
-                model=get_model(),
-                messages=[{"role": "user", "content": prompt}],
-            )
-            lines = response.choices[0].message.content.strip().splitlines()
-            score = int(lines[0].strip())
-            score = max(1, min(5, score))
-            feedback = lines[1].strip() if len(lines) > 1 else ""
-            critique = f"Assertion quality ({score}/5): {feedback}" if feedback else ""
-            return score, critique
-        except Exception as exc:
-            logger.warning("Assertion score LLM check failed (%s) — defaulting to score=3", exc)
-            return 3, ""

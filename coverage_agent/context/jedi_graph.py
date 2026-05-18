@@ -7,7 +7,7 @@ from pathlib import Path
 import jedi
 import litellm
 
-from coverage_agent.config import is_dry_run
+from coverage_agent.context.branch_conditions import extract_branch_condition_from_source
 from coverage_agent.contracts.schemas import ContextPayload
 
 logger = logging.getLogger(__name__)
@@ -86,6 +86,8 @@ def build_context(
     target_symbol: str,
     depth: int = 1,
     repo_root: str = ".",
+    offline: bool = False,
+    from_line: int | None = None,
 ) -> ContextPayload:
     """
     Constructs a ContextPayload for the given target symbol.
@@ -94,7 +96,7 @@ def build_context(
     local path to the cloned repository. All file reads are resolved as
     Path(repo_root) / file_path.
 
-    In DRY_RUN mode, returns the fixture from fixtures/sample_context.json.
+    In offline mode, returns the fixture from fixtures/sample_context.json.
 
     Depth 0: target function source only.
     Depth 1: target + immediate callees resolved via Jedi goto().
@@ -104,10 +106,10 @@ def build_context(
     when adding the next level would exceed the budget.
     Falls back to local file scope with fallback_used=True if Jedi fails.
     """
-    if is_dry_run():
+    if offline:
         fixture_path = _FIXTURES_DIR / "sample_context.json"
         data = json.loads(fixture_path.read_text(encoding="utf-8"))
-        logger.info("[DRY_RUN] build_context returning fixture for %s:%s", file_path, target_symbol)
+        logger.info("[OFFLINE] build_context returning fixture for %s:%s", file_path, target_symbol)
         return ContextPayload(**data)
 
     resolved_path = str(Path(repo_root) / file_path)
@@ -159,10 +161,23 @@ def build_context(
 
     tokens_used = _count_tokens(primary_code) + sum(_count_tokens(v) for v in dependencies.values())
 
+    # Best-effort branch condition extraction (Phase C). Hands TestWriter the
+    # condition controlling the target branch so it can pick inputs that
+    # actually trigger it. Silently None on extraction failure — the pipeline
+    # works fine without the hint, it's a quality boost.
+    branch_hint: str | None = None
+    if from_line is not None:
+        try:
+            file_source = Path(resolved_path).read_text(encoding="utf-8")
+            branch_hint = extract_branch_condition_from_source(file_source, from_line)
+        except Exception as exc:
+            logger.debug("Branch condition extraction failed for %s:L%d: %s", resolved_path, from_line, exc)
+
     return ContextPayload(
         primary_code=primary_code,
         dependencies_code=dependencies,
         graph_depth_used=depth_used,
         tokens_used=tokens_used,
         fallback_used=fallback_used,
+        branch_condition_hint=branch_hint,
     )
