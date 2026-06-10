@@ -1,10 +1,10 @@
-"""RegressionGuard — sandbox-only agent. No LLM calls, all coverage is offline."""
+"""RegressionGuard — deterministic, no LLM calls."""
 from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-from coverage_agent.agents.regression_guard import RegressionGuard, _filename_for
-from coverage_agent.contracts.schemas import (
+from coverage_agent.engine.regression import RegressionGuard, _filename_for
+from coverage_agent.contracts import (
     BranchGap,
     CoverageGap,
     ExecutionResult,
@@ -52,11 +52,11 @@ def test_filename_is_stable_and_collision_free():
     fa = _filename_for(a)
     fb = _filename_for(b)
     assert fa.endswith(".py")
-    assert fa != fb  # different branches → different filenames
+    assert fa != fb
 
 
-def test_skipped_when_nothing_committed(offline_creds):
-    result = RegressionGuard(offline_creds).run(
+def test_skipped_when_nothing_committed(creds):
+    result = RegressionGuard(creds).run(
         sandbox=MagicMock(),
         committed_results=[_make_gap_result(False)],
         baseline_passed=12,
@@ -67,9 +67,10 @@ def test_skipped_when_nothing_committed(offline_creds):
     assert result.new_failures == 0
 
 
-def test_offline_path_returns_clean_pass(offline_creds):
-    sandbox = MagicMock()  # never called in offline mode
-    result = RegressionGuard(offline_creds).run(
+def test_accepted_tests_persisted_and_suite_reruns(creds):
+    sandbox = MagicMock()
+    sandbox.count_test_outcomes.return_value = (14, 0)
+    result = RegressionGuard(creds).run(
         sandbox=sandbox,
         committed_results=[_make_gap_result(True), _make_gap_result(True)],
         baseline_passed=12,
@@ -77,31 +78,30 @@ def test_offline_path_returns_clean_pass(offline_creds):
     )
     assert result.skipped is False
     assert result.regression_detected is False
-    assert result.post_passed == 14  # 12 + 2 new
-    sandbox.persist_test.assert_not_called()
-    sandbox.count_test_outcomes.assert_not_called()
+    assert result.post_passed == 14
+    assert sandbox.persist_test.call_count == 2
+    sandbox.count_test_outcomes.assert_called_once()
 
 
-def test_byok_flags_regression_when_post_failures_exceed_baseline(byok_creds):
+def test_flags_regression_when_post_failures_exceed_baseline(creds):
     sandbox = MagicMock()
-    sandbox.count_test_outcomes.return_value = (14, 1)  # one new failure
-    result = RegressionGuard(byok_creds).run(
+    sandbox.count_test_outcomes.return_value = (14, 1)
+    result = RegressionGuard(creds).run(
         sandbox=sandbox,
         committed_results=[_make_gap_result(True), _make_gap_result(True)],
         baseline_passed=14,
         baseline_failed=0,
     )
     assert sandbox.persist_test.call_count == 2
-    sandbox.count_test_outcomes.assert_called_once()
     assert result.regression_detected is True
     assert result.new_failures == 1
     assert "Regression detected" in result.summary
 
 
-def test_byok_clean_when_no_new_failures(byok_creds):
+def test_clean_when_no_new_failures(creds):
     sandbox = MagicMock()
     sandbox.count_test_outcomes.return_value = (15, 0)
-    result = RegressionGuard(byok_creds).run(
+    result = RegressionGuard(creds).run(
         sandbox=sandbox,
         committed_results=[_make_gap_result(True)],
         baseline_passed=14,

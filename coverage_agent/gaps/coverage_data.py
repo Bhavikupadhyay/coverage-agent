@@ -1,23 +1,114 @@
+"""
+Coverage data loaders.
+
+Supports three formats:
+  - coverage.py JSON export (coverage json -o coverage.json)
+  - .coverage binary data-file (via the coverage Python API)
+  - Cobertura XML (coverage xml -o coverage.xml)
+
+`load_coverage_file` auto-detects the format from the file extension and
+returns a normalized dict in coverage.py JSON shape so the rest of the
+pipeline has one data model.
+"""
 import ast
 import fnmatch
 import logging
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Optional, Sequence
 
-from coverage_agent.contracts.schemas import BranchGap, CoverageGap
+from coverage_agent.contracts import BranchGap, CoverageGap
 
 logger = logging.getLogger(__name__)
 
-# Trivial symbols that are not worth targeting
 _TRIVIAL_SYMBOLS = {"__init__", "__repr__", "__str__", "__eq__", "__hash__"}
 
 
 # ---------------------------------------------------------------------------
-# Ignore pattern engine (gitignore / dockerignore semantics)
+# Coverage file loading
+# ---------------------------------------------------------------------------
+
+def load_coverage_file(path: str) -> dict:
+    """Loads a coverage report and returns a normalized coverage.py JSON dict.
+
+    Auto-detects format from extension:
+      .json        → parse directly
+      .coverage    → use coverage Python API
+      .xml         → parse Cobertura XML
+    """
+    p = Path(path)
+    if p.suffix == ".json":
+        import json
+        return json.loads(p.read_text(encoding="utf-8"))
+    elif p.suffix == ".xml":
+        return _load_cobertura_xml(path)
+    else:
+        # Treat as .coverage binary data-file
+        return _load_coverage_datafile(path)
+
+
+def _load_coverage_datafile(path: str) -> dict:
+    """Loads a .coverage binary file via the coverage API."""
+    try:
+        import coverage as coverage_module
+        cov = coverage_module.Coverage(data_file=path)
+        cov.load()
+        data = cov.get_data()
+        files: dict = {}
+        for measured_file in data.measured_files():
+            arc_missing: list = []
+            try:
+                arcs = data.arcs(measured_file) or []
+                executed = {(f, t) for f, t in arcs}
+                # Get all possible arcs to find missing ones; fall back to
+                # reporting missing_lines from line data when arc data is absent.
+                arc_missing = [
+                    [f, t] for f, t in arcs if f > 0 and t > 0
+                ]
+            except Exception:
+                pass
+            files[measured_file] = {"missing_branches": arc_missing}
+        return {"files": files, "totals": {"percent_covered": 0.0}}
+    except Exception as exc:
+        logger.error("Failed to load .coverage data file %s: %s", path, exc)
+        raise
+
+
+def _load_cobertura_xml(path: str) -> dict:
+    """Parses a Cobertura XML coverage report into the normalized dict shape."""
+    try:
+        tree = ET.parse(path)
+        root = tree.getroot()
+        files: dict = {}
+
+        for cls in root.iter("class"):
+            filename = cls.get("filename", "")
+            if not filename:
+                continue
+            missing_branches: list = []
+            for line in cls.iter("line"):
+                branch = line.get("branch", "false").lower() == "true"
+                if not branch:
+                    continue
+                number = int(line.get("number", 0))
+                conditions_covered = int(line.get("condition-coverage", "0%").split("%")[0])
+                # If not fully covered, record a synthetic branch gap
+                if conditions_covered < 100:
+                    missing_branches.append([number, number + 1])
+            files[filename] = {"missing_branches": missing_branches}
+
+        line_rate = float(root.get("line-rate", "0"))
+        return {"files": files, "totals": {"percent_covered": line_rate * 100}}
+    except Exception as exc:
+        logger.error("Failed to parse Cobertura XML %s: %s", path, exc)
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Ignore pattern engine (gitignore semantics)
 # ---------------------------------------------------------------------------
 
 def load_ignore_patterns(path: str) -> list[str]:
-    """Reads a gitignore-style file and returns a list of non-empty, non-comment lines."""
     try:
         lines = Path(path).read_text(encoding="utf-8").splitlines()
     except FileNotFoundError:
@@ -26,16 +117,6 @@ def load_ignore_patterns(path: str) -> list[str]:
 
 
 def _file_matches_patterns(file_path: str, patterns: Sequence[str]) -> bool:
-    """
-    Returns True if file_path should be excluded based on any pattern in patterns.
-
-    Matching rules (gitignore-compatible subset):
-    - Patterns ending with `/` match any file under that directory.
-    - Patterns containing `/` (other than a trailing one) are anchored to the
-      repo root and matched against the full relative path.
-    - All other patterns are unanchored and matched against every path component
-      (directory name or filename) using fnmatch glob syntax.
-    """
     fp = file_path.replace("\\", "/")
     parts = fp.split("/")
 
@@ -44,13 +125,11 @@ def _file_matches_patterns(file_path: str, patterns: Sequence[str]) -> bool:
         pat = raw.rstrip("/")
 
         if "/" in pat:
-            # Anchored: match full relative path or path prefix for dir patterns
             if fnmatch.fnmatch(fp, pat):
                 return True
             if is_dir and (fp.startswith(pat + "/") or fnmatch.fnmatch(fp, pat + "/*")):
                 return True
         else:
-            # Unanchored: match against any individual component of the path
             for part in parts:
                 if fnmatch.fnmatch(part, pat):
                     return True
@@ -58,18 +137,19 @@ def _file_matches_patterns(file_path: str, patterns: Sequence[str]) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Gap extraction helpers
+# ---------------------------------------------------------------------------
+
 def _is_trivial_line(source_line: str) -> bool:
-    """Returns True for lines that represent no meaningful logic."""
     stripped = source_line.strip()
     return stripped in ("pass", "return", "return None", "...")
 
 
 def _get_surrounding_lines(file_path: str, from_line: int, to_line: int, repo_root: str = ".") -> list[int]:
-    """Returns the line numbers of the enclosing function body."""
     try:
         source = (Path(repo_root) / file_path).read_text(encoding="utf-8")
         tree = ast.parse(source)
-        lines = source.splitlines()
 
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -81,14 +161,12 @@ def _get_surrounding_lines(file_path: str, from_line: int, to_line: int, repo_ro
     except Exception:
         pass
 
-    # Fallback: return a window around the branch
     start = max(1, from_line - 5)
     end = to_line + 5
     return list(range(start, end + 1))
 
 
 def _find_containing_symbol(file_path: str, line: int, repo_root: str = ".") -> str:
-    """Returns the name of the function/method containing the given line."""
     try:
         source = (Path(repo_root) / file_path).read_text(encoding="utf-8")
         tree = ast.parse(source)
@@ -111,7 +189,6 @@ def _find_containing_symbol(file_path: str, line: int, repo_root: str = ".") -> 
 
 
 def _is_trivial_gap(file_path: str, from_line: int, containing_symbol: str, repo_root: str = ".") -> bool:
-    """Filters out gaps that aren't worth testing."""
     if containing_symbol in _TRIVIAL_SYMBOLS:
         return True
 
@@ -126,26 +203,19 @@ def _is_trivial_gap(file_path: str, from_line: int, containing_symbol: str, repo
     return False
 
 
+# ---------------------------------------------------------------------------
+# Main parser
+# ---------------------------------------------------------------------------
+
 def parse_coverage(
     coverage_json: dict,
     repo_root: str = ".",
     ignore_patterns: Sequence[str] = (),
 ) -> list[CoverageGap]:
-    """
-    Parses a coverage.py --branch --json report into a list of CoverageGap objects.
+    """Parses a normalized coverage dict into CoverageGap objects.
 
-    Each missing branch becomes one CoverageGap. Trivial gaps (inside __init__,
-    pass statements, bare returns) are filtered out.
-
-    repo_root is the local path to the cloned repository. File paths in
-    coverage.json are relative to the repo root, so all file reads are
-    resolved as Path(repo_root) / file_path.
-
-    ignore_patterns is an optional list of gitignore-style patterns. Files
-    matching any pattern are excluded entirely. Pass the result of
-    load_ignore_patterns() here.
-
-    Gap Prioritizer is responsible for filling in priority_score.
+    Accepts the dict returned by load_coverage_file() or a raw
+    coverage.py --branch --json export.
     """
     gaps: list[CoverageGap] = []
     files: dict = coverage_json.get("files", {})

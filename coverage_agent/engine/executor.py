@@ -2,7 +2,7 @@ import logging
 from typing import Any
 
 from coverage_agent.credentials import Credentials
-from coverage_agent.contracts.schemas import CoverageGap, DraftTest, ExecutionResult
+from coverage_agent.contracts import CoverageGap, DraftTest, ExecutionResult
 
 logger = logging.getLogger(__name__)
 
@@ -19,12 +19,10 @@ def _is_system_error(stderr: str) -> bool:
 
 
 class ExecutionRunner:
-    """
-    Runs a DraftTest inside the E2B sandbox and measures real coverage impact.
+    """Runs a DraftTest and measures real coverage impact.
 
-    Wraps E2BSandbox.run_test() with flakiness detection: if the first run
-    succeeds, it is re-run twice more. If results are inconsistent the test
-    is marked flaky and skipped (execution_success=False, flaky=True).
+    Wraps sandbox.run_test() with flakiness detection: if the first run
+    succeeds, it is re-run twice more. Inconsistent results → flaky=True.
     """
 
     def __init__(self, credentials: Credentials) -> None:
@@ -58,7 +56,6 @@ class ExecutionRunner:
                 return first.model_copy(update={"is_system_error": True})
             return first
 
-        # Re-run twice to detect flakiness
         results = [first]
         for _ in range(2):
             result = sandbox.run_test(draft.test_code, **run_kwargs)
@@ -82,5 +79,4 @@ class ExecutionRunner:
                 flaky=True,
             )
 
-        # All 3 runs passed — return the first result (coverage delta is consistent)
         return first

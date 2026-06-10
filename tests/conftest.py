@@ -1,42 +1,27 @@
-"""Shared pytest fixtures.
-
-Every test in this suite runs in OFFLINE_MODE by default. Tests that need to
-exercise real LLM/E2B paths must mock them explicitly.
-"""
+"""Shared pytest fixtures."""
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 import pytest
 
-os.environ.setdefault("OFFLINE_MODE", "true")
-
-from coverage_agent.contracts.schemas import (  # noqa: E402
+from coverage_agent.contracts import (
     BranchGap,
     ContextPayload,
     CoverageGap,
     DraftTest,
 )
-from coverage_agent.credentials import Credentials  # noqa: E402
+from coverage_agent.credentials import Credentials
 
 _FIXTURES_DIR = Path(__file__).parent.parent / "coverage_agent" / "fixtures"
 
-
-@pytest.fixture
-def offline_creds() -> Credentials:
-    return Credentials.for_offline()
+_TEST_CREDS = Credentials(llm_api_key="gsk_test-key-xxxx", llm_model="groq/llama-3.3-70b-versatile")
 
 
 @pytest.fixture
-def byok_creds() -> Credentials:
-    return Credentials(
-        mode="byok",
-        llm_api_key="test-llm-key-xxxx",
-        llm_model="groq/llama-3.3-70b-versatile",
-        e2b_api_key="test-e2b-key-xxxx",
-    )
+def creds() -> Credentials:
+    return _TEST_CREDS
 
 
 @pytest.fixture

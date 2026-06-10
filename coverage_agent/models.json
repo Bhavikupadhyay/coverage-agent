@@ -1,0 +1,206 @@
+{
+  "models": [
+    {
+      "id": "gemini/gemini-2.5-flash",
+      "provider": "gemini",
+      "key_env": "GEMINI_API_KEY",
+      "key_prefix": "AIza",
+      "tool_calling": true,
+      "free_tier": true,
+      "default": true,
+      "notes": "Free tier with generous limits. Recommended default."
+    },
+    {
+      "id": "gemini/gemini-2.5-pro",
+      "provider": "gemini",
+      "key_env": "GEMINI_API_KEY",
+      "key_prefix": "AIza",
+      "tool_calling": true,
+      "free_tier": false,
+      "pricing_per_mtok": [1.25, 10.0],
+      "notes": "Highest-quality Gemini model. Use for hard gaps."
+    },
+    {
+      "id": "gemini/gemini-2.0-flash",
+      "provider": "gemini",
+      "key_env": "GEMINI_API_KEY",
+      "key_prefix": "AIza",
+      "tool_calling": true,
+      "free_tier": true,
+      "notes": "Previous-gen flash. Stable and fast."
+    },
+    {
+      "id": "openai/gpt-4o",
+      "provider": "openai",
+      "key_env": "OPENAI_API_KEY",
+      "key_prefix": "sk-",
+      "tool_calling": true,
+      "free_tier": false,
+      "pricing_per_mtok": [2.5, 10.0]
+    },
+    {
+      "id": "openai/gpt-4o-mini",
+      "provider": "openai",
+      "key_env": "OPENAI_API_KEY",
+      "key_prefix": "sk-",
+      "tool_calling": true,
+      "free_tier": false,
+      "pricing_per_mtok": [0.15, 0.6]
+    },
+    {
+      "id": "openai/o4-mini",
+      "provider": "openai",
+      "key_env": "OPENAI_API_KEY",
+      "key_prefix": "sk-",
+      "tool_calling": true,
+      "free_tier": false,
+      "pricing_per_mtok": [1.1, 4.4],
+      "notes": "Reasoning model. High quality on complex logic branches."
+    },
+    {
+      "id": "openai/o3",
+      "provider": "openai",
+      "key_env": "OPENAI_API_KEY",
+      "key_prefix": "sk-",
+      "tool_calling": true,
+      "free_tier": false,
+      "pricing_per_mtok": [10.0, 40.0],
+      "notes": "Top OpenAI reasoning model."
+    },
+    {
+      "id": "anthropic/claude-opus-4-8",
+      "provider": "anthropic",
+      "key_env": "ANTHROPIC_API_KEY",
+      "key_prefix": "sk-ant-",
+      "tool_calling": true,
+      "free_tier": false,
+      "pricing_per_mtok": [15.0, 75.0]
+    },
+    {
+      "id": "anthropic/claude-sonnet-4-6",
+      "provider": "anthropic",
+      "key_env": "ANTHROPIC_API_KEY",
+      "key_prefix": "sk-ant-",
+      "tool_calling": true,
+      "free_tier": false,
+      "pricing_per_mtok": [3.0, 15.0]
+    },
+    {
+      "id": "anthropic/claude-haiku-4-5",
+      "provider": "anthropic",
+      "key_env": "ANTHROPIC_API_KEY",
+      "key_prefix": "sk-ant-",
+      "tool_calling": true,
+      "free_tier": false,
+      "pricing_per_mtok": [0.8, 4.0]
+    },
+    {
+      "id": "xai/grok-3",
+      "provider": "xai",
+      "key_env": "XAI_API_KEY",
+      "key_prefix": "xai-",
+      "tool_calling": true,
+      "free_tier": false,
+      "pricing_per_mtok": [3.0, 15.0]
+    },
+    {
+      "id": "xai/grok-3-mini",
+      "provider": "xai",
+      "key_env": "XAI_API_KEY",
+      "key_prefix": "xai-",
+      "tool_calling": true,
+      "free_tier": false,
+      "pricing_per_mtok": [0.3, 0.5],
+      "notes": "Fast and cheap. Good for straightforward gaps."
+    },
+    {
+      "id": "xai/grok-2-1212",
+      "provider": "xai",
+      "key_env": "XAI_API_KEY",
+      "key_prefix": "xai-",
+      "tool_calling": true,
+      "free_tier": false,
+      "pricing_per_mtok": [2.0, 10.0]
+    },
+    {
+      "id": "groq/llama-3.3-70b-versatile",
+      "provider": "groq",
+      "key_env": "GROQ_API_KEY",
+      "key_prefix": "gsk_",
+      "tool_calling": true,
+      "free_tier": true,
+      "notes": "Fast inference. Free tier with rate limits."
+    },
+    {
+      "id": "groq/llama-3.1-8b-instant",
+      "provider": "groq",
+      "key_env": "GROQ_API_KEY",
+      "key_prefix": "gsk_",
+      "tool_calling": false,
+      "free_tier": true,
+      "notes": "Fastest Groq model. Limited reasoning quality."
+    },
+    {
+      "id": "groq/deepseek-r1-distill-llama-70b",
+      "provider": "groq",
+      "key_env": "GROQ_API_KEY",
+      "key_prefix": "gsk_",
+      "tool_calling": false,
+      "free_tier": true,
+      "notes": "Reasoning model on Groq infra. No tool-calling."
+    },
+    {
+      "id": "groq/gemma2-9b-it",
+      "provider": "groq",
+      "key_env": "GROQ_API_KEY",
+      "key_prefix": "gsk_",
+      "tool_calling": false,
+      "free_tier": true
+    },
+    {
+      "id": "cerebras/llama-3.3-70b",
+      "provider": "cerebras",
+      "key_env": "CEREBRAS_API_KEY",
+      "key_prefix": "csk-",
+      "tool_calling": true,
+      "free_tier": true,
+      "notes": "Extremely fast inference (wafer-scale chip). Free tier available."
+    },
+    {
+      "id": "cerebras/llama3.1-8b",
+      "provider": "cerebras",
+      "key_env": "CEREBRAS_API_KEY",
+      "key_prefix": "csk-",
+      "tool_calling": false,
+      "free_tier": true
+    },
+    {
+      "id": "mistral/mistral-large-latest",
+      "provider": "mistral",
+      "key_env": "MISTRAL_API_KEY",
+      "key_prefix": "",
+      "tool_calling": true,
+      "free_tier": false,
+      "pricing_per_mtok": [2.0, 6.0]
+    },
+    {
+      "id": "mistral/codestral-latest",
+      "provider": "mistral",
+      "key_env": "MISTRAL_API_KEY",
+      "key_prefix": "",
+      "tool_calling": true,
+      "free_tier": false,
+      "pricing_per_mtok": [0.3, 0.9],
+      "notes": "Code-specialized model from Mistral. Strong on Python."
+    },
+    {
+      "id": "mistral/mistral-small-latest",
+      "provider": "mistral",
+      "key_env": "MISTRAL_API_KEY",
+      "key_prefix": "",
+      "tool_calling": true,
+      "free_tier": false,
+      "pricing_per_mtok": [0.1, 0.3]
+    }
+  ]
+}

@@ -3,11 +3,11 @@ from typing import Any, Callable, Optional, TypedDict
 
 from langgraph.graph import END, StateGraph
 
-from coverage_agent.agents.context_architect import ContextArchitect
-from coverage_agent.agents.eval_agent import EvalAgent
-from coverage_agent.agents.execution_runner import ExecutionRunner
-from coverage_agent.agents.test_writer import TestWriter
-from coverage_agent.contracts.schemas import (
+from coverage_agent.context.jedi_graph import JediContextGraph
+from coverage_agent.engine.validator import EvalAgent
+from coverage_agent.engine.executor import ExecutionRunner
+from coverage_agent.engine.writer import TestWriter
+from coverage_agent.contracts import (
     ContextPayload,
     CoverageGap,
     DraftTest,
@@ -21,10 +21,10 @@ logger = logging.getLogger(__name__)
 
 
 class PipelineState(TypedDict):
-    # Inputs — set by Orchestrator before each gap
+    # Inputs — set before each gap
     repo_path: str
     target_gap: CoverageGap
-    baseline_coverage: dict           # coverage.json dict from run_coverage_baseline()
+    baseline_coverage: dict
 
     # Agent outputs — populated as pipeline runs
     context: Optional[ContextPayload]
@@ -33,29 +33,41 @@ class PipelineState(TypedDict):
     exec_result: Optional[ExecutionResult]
 
     # Loop management
-    loop_count: int                   # increments on every REWRITE or RECONTEXTUALIZE
-    context_depth_requested: int      # starts at 1, incremented on RECONTEXTUALIZE
-    last_critique: Optional[str]      # Eval Agent critique forwarded to Test Writer on retry
-    skipped: bool                     # True if loop_count hit limit without EXECUTE
-    gap_difficulty: str               # "easy" or "hard" — set by gap_filter node
+    loop_count: int
+    context_depth_requested: int
+    last_critique: Optional[str]
+    skipped: bool
+    gap_difficulty: str
 
 
 # ---------------------------------------------------------------------------
 # Node functions
 # ---------------------------------------------------------------------------
 
-def _make_context_architect_node(sandbox: Any, credentials: Credentials):
+def _make_context_architect_node(credentials: Credentials):
     def _context_architect_node(state: PipelineState) -> dict:
-        depth_override = state["context_depth_requested"] if state["loop_count"] > 0 else None
-        context = ContextArchitect(credentials).run(
-            state["target_gap"],
-            depth_override=depth_override,
-            repo_root=state["repo_path"],
-            sandbox=sandbox,
-        )
+        from coverage_agent.context.jedi_graph import JediContextGraph
+        from coverage_agent.context.branch_conditions import extract_branch_condition_from_source
+        depth = state["context_depth_requested"] if state["loop_count"] > 0 else 1
+        gap = state["target_gap"]
+        repo_root = state["repo_path"] or "."
+
+        jedi = JediContextGraph(repo_root=repo_root)
+        context = jedi.build_context(gap, depth_override=depth)
+
+        # Attach branch condition hint if not already present
+        if context.branch_condition_hint is None:
+            try:
+                from pathlib import Path
+                src = (Path(repo_root) / gap.file_path).read_text(encoding="utf-8")
+                hint = extract_branch_condition_from_source(src, gap.branch.from_line)
+                context = context.model_copy(update={"branch_condition_hint": hint})
+            except Exception:
+                pass
+
         logger.info(
             "context_architect: gap=%s depth=%d tokens=%d",
-            state["target_gap"].gap_id,
+            gap.gap_id,
             context.graph_depth_used,
             context.tokens_used,
         )
@@ -64,18 +76,19 @@ def _make_context_architect_node(sandbox: Any, credentials: Credentials):
 
 
 def _make_gap_filter_node():
-    from coverage_agent.agents.gap_filter import GapFilter
-    _filter = GapFilter()
-
     def _gap_filter_node(state: PipelineState) -> dict:
-        difficulty = _filter.classify(state["context"])
+        # IO-difficulty heuristic: demotes (marks hard) but never skips.
+        # Phase 0 placeholder — full heuristic lands in gaps/select.py in Phase 1.
+        context = state.get("context")
+        difficulty = "easy"
+        if context and context.tokens_used > 8000:
+            difficulty = "hard"
         logger.info(
             "gap_filter: gap=%s difficulty=%s",
             state["target_gap"].gap_id,
             difficulty,
         )
         return {"gap_difficulty": difficulty}
-
     return _gap_filter_node
 
 
@@ -107,10 +120,9 @@ def _make_eval_agent_node(credentials: Credentials):
             state["target_gap"],
         )
         logger.info(
-            "eval_agent: gap=%s syntax=%s assert=%d route=%s loop=%d",
+            "eval_agent: gap=%s syntax=%s route=%s loop=%d",
             state["target_gap"].gap_id,
             result.syntax_valid,
-            result.assertion_score,
             result.route,
             state["loop_count"],
         )
@@ -143,20 +155,14 @@ def _make_execution_runner_node(sandbox: Any, credentials: Credentials):
         )
         updates: dict = {"exec_result": exec_result}
 
-        # System-level failures (parallel mode, missing module, etc.) cannot be
-        # fixed by rewriting the test. Skip immediately without burning retry budget.
         if exec_result.is_system_error:
             return updates
 
-        # If this result is good enough to commit (per strictness predicate), we
-        # don't bump the loop counter or build a critique — the route function
-        # will send us to COMMIT. Otherwise prep state for a retry through
-        # TestWriter with sandbox stderr as the next critique.
         if not credentials.should_commit(exec_result):
             if not exec_result.execution_success:
                 stderr = (exec_result.stderr_trace or "").strip()
                 updates["last_critique"] = (
-                    "The previous attempt CRASHED at runtime in the sandbox. "
+                    "The previous attempt CRASHED at runtime. "
                     "Here is the captured stderr:\n"
                     f"```\n{stderr[:1800]}\n```\n"
                     "Inspect the trace and fix the failing assertion, mock setup, "
@@ -164,8 +170,6 @@ def _make_execution_runner_node(sandbox: Any, credentials: Credentials):
                     "with `pytest` exit code 0."
                 )
             else:
-                # Executed cleanly but missed the target branch — retry with the
-                # actual condition text so TestWriter doesn't guess a second time.
                 gap = state["target_gap"]
                 hint = state["context"].branch_condition_hint if state.get("context") else None
                 hint_line = (
@@ -185,16 +189,11 @@ def _make_execution_runner_node(sandbox: Any, credentials: Credentials):
     return _execution_runner_node
 
 
-def _commit_node(state: PipelineState) -> dict:
-    """Terminal node for tests that satisfy the strictness predicate.
-
-    Pipeline keeps the commit decision and the loop budget separate from the
-    orchestrator's bookkeeping — this node just emits a clean log line and a
-    UI event boundary. The actual write-to-disk happens in the orchestrator.
-    """
+def _accept_node(state: PipelineState) -> dict:
+    """Terminal node for tests that pass the acceptance gate."""
     exec_result = state["exec_result"]
     logger.info(
-        "commit: gap=%s — exec_success=%s branch_hit=%s — sending to orchestrator for write",
+        "accept: gap=%s — exec_success=%s branch_hit=%s",
         state["target_gap"].gap_id,
         exec_result.execution_success if exec_result else None,
         exec_result.target_branch_hit if exec_result else None,
@@ -204,7 +203,7 @@ def _commit_node(state: PipelineState) -> dict:
 
 def _skip_node(state: PipelineState) -> dict:
     logger.info(
-        "skip: gap=%s reached loop limit (%d loops) — skipping",
+        "skip: gap=%s reached loop limit (%d loops)",
         state["target_gap"].gap_id,
         state["loop_count"],
     )
@@ -216,7 +215,6 @@ def _skip_node(state: PipelineState) -> dict:
 # ---------------------------------------------------------------------------
 
 def _make_route_after_eval(credentials: Credentials):
-    """Strictness-aware Eval routing. Captures the loop budget via closure."""
     max_loops = credentials.max_retry_loops()
 
     def _route(state: PipelineState) -> str:
@@ -233,11 +231,6 @@ def _make_route_after_eval(credentials: Credentials):
 
 
 def _make_route_after_execution(credentials: Credentials):
-    """Decides whether a sandbox result is commit-worthy or needs another loop.
-
-    The strictness predicate lives on Credentials so this routing and the
-    orchestrator's final commit decision can't drift apart.
-    """
     max_loops = credentials.max_retry_loops()
 
     def _route(state: PipelineState) -> str:
@@ -245,7 +238,7 @@ def _make_route_after_execution(credentials: Credentials):
         if exec_result and exec_result.is_system_error:
             return "SKIP"
         if credentials.should_commit(exec_result):
-            return "COMMIT"
+            return "ACCEPT"
         if state["loop_count"] >= max_loops:
             return "SKIP"
         return "TEST_WRITER"
@@ -257,12 +250,7 @@ def _make_route_after_execution(credentials: Credentials):
 # Node tracing wrapper
 # ---------------------------------------------------------------------------
 
-def _traced(
-    fn: Callable,
-    name: str,
-    cb: Optional[Callable],
-) -> Callable:
-    """Wraps a node function to emit agent_start / agent_end events via cb."""
+def _traced(fn: Callable, name: str, cb: Optional[Callable]) -> Callable:
     def _inner(state: PipelineState) -> dict:
         gap_id = state["target_gap"].gap_id if state.get("target_gap") else ""
         loop = state.get("loop_count", 0)
@@ -284,23 +272,16 @@ def build_pipeline(
     credentials: Credentials,
     event_callback: Optional[Callable] = None,
 ):
-    """
-    Builds and compiles the LangGraph pipeline for a single gap.
-
-    The sandbox and credentials are captured via closure so they can be reused
-    across all gaps without being serialized into PipelineState.
-    If event_callback is provided it is called as:
-        cb(event_type, agent_name, loop_count, gap_id, data)
-    """
+    """Builds and compiles the LangGraph graph for a single gap."""
     graph = StateGraph(PipelineState)
     cb = event_callback
 
-    graph.add_node("context_architect", _traced(_make_context_architect_node(sandbox, credentials), "context_architect", cb))
+    graph.add_node("context_architect", _traced(_make_context_architect_node(credentials), "context_architect", cb))
     graph.add_node("gap_filter", _traced(_make_gap_filter_node(), "gap_filter", cb))
     graph.add_node("test_writer", _traced(_make_test_writer_node(credentials), "test_writer", cb))
     graph.add_node("eval_agent", _traced(_make_eval_agent_node(credentials), "eval_agent", cb))
     graph.add_node("execution_runner", _traced(_make_execution_runner_node(sandbox, credentials), "execution_runner", cb))
-    graph.add_node("commit", _traced(_commit_node, "commit", cb))
+    graph.add_node("accept", _traced(_accept_node, "accept", cb))
     graph.add_node("skip", _traced(_skip_node, "skip", cb))
 
     graph.set_entry_point("context_architect")
@@ -323,28 +304,24 @@ def build_pipeline(
         },
     )
 
-    # New retry edge: sandbox is the ultimate judge. On runtime failure or a
-    # missed target branch (strict mode), the stderr/critique flows back into
-    # TestWriter for another attempt. Without this, the pipeline gives up
-    # after a single sandbox attempt — historically the #1 cause of 0% commits.
     graph.add_conditional_edges(
         "execution_runner",
         _make_route_after_execution(credentials),
         {
             "TEST_WRITER": "test_writer",
-            "COMMIT": "commit",
+            "ACCEPT": "accept",
             "SKIP": "skip",
         },
     )
 
-    graph.add_edge("commit", END)
+    graph.add_edge("accept", END)
     graph.add_edge("skip", END)
 
     return graph.compile()
 
 
 # ---------------------------------------------------------------------------
-# Entry point used by Orchestrator
+# Entry point
 # ---------------------------------------------------------------------------
 
 def run_pipeline(
@@ -353,16 +330,9 @@ def run_pipeline(
     credentials: Credentials,
     baseline_coverage: dict,
     repo_path: str = "",
-    braintrust_logger=None,
     event_callback: Optional[Callable] = None,
 ) -> tuple[GapResult, PipelineState]:
-    """
-    Runs one gap through the full LangGraph pipeline.
-
-    Builds a fresh compiled graph per call (cheap — no I/O). The sandbox and
-    credentials are reused across all gaps via closure. Returns a GapResult.
-    If a BraintrustLogger is provided, the result is logged before returning.
-    """
+    """Runs one gap through the full LangGraph pipeline. Returns a GapResult."""
     compiled = build_pipeline(sandbox, credentials, event_callback=event_callback)
 
     initial_state: PipelineState = {
@@ -388,11 +358,8 @@ def run_pipeline(
         loops_taken=final_state["loop_count"],
         phase1_scores=final_state.get("eval_result"),
         phase2_scores=final_state.get("exec_result"),
-        final_test_committed=False,  # Orchestrator sets this after writing the test file
+        final_test_committed=False,
         gap_difficulty=final_state.get("gap_difficulty", "easy"),
     )
-
-    if braintrust_logger is not None:
-        braintrust_logger.log(gap_result, final_state)
 
     return gap_result, final_state

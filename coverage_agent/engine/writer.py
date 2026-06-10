@@ -5,12 +5,15 @@ from pathlib import Path
 import litellm
 
 from coverage_agent.credentials import Credentials
-from coverage_agent.contracts.schemas import ContextPayload, CoverageGap, DraftTest
-from coverage_agent.sandbox.e2b_runner import _COVERAGE_SRC_LAYOUT
+from coverage_agent.contracts import ContextPayload, CoverageGap, DraftTest
 
 logger = logging.getLogger(__name__)
 
 _FIXTURES_DIR = Path(__file__).parent.parent / "fixtures"
+
+# Common src-layout prefixes that wrap an installable package. The prefix is
+# repo layout only — tests must import the package underneath, not the prefix.
+_SRC_LAYOUT_DIRS = frozenset({"src", "lib", "python", "source", "packages", "pkg"})
 
 
 _SYSTEM_PROMPT = """\
@@ -31,7 +34,6 @@ Rules:
 
 
 def _extract_code_block(content: str) -> str:
-    """Strips markdown code fences if the LLM wrapped the output."""
     match = re.search(r"```(?:python)?\n(.*?)```", content, re.DOTALL)
     if match:
         return match.group(1).strip()
@@ -39,14 +41,13 @@ def _extract_code_block(content: str) -> str:
 
 
 def _extract_mocks(test_code: str) -> list[str]:
-    """Extracts all patch targets from @patch decorators and patch() calls."""
     return re.findall(r'patch\(["\']([^"\']+)["\']', test_code)
 
 
 def _layout_import_hint(file_path: str) -> str:
-    """Extra user prompt when the gap path uses src/lib layout — avoids `import src`."""
+    """Extra prompt hint when the gap path uses a src/lib layout."""
     parts = [p for p in Path(file_path).parts if p not in (".", "..")]
-    if len(parts) < 2 or parts[0] not in _COVERAGE_SRC_LAYOUT:
+    if len(parts) < 2 or parts[0] not in _SRC_LAYOUT_DIRS:
         return ""
     pkg = parts[1].removesuffix(".py")
     if not pkg:
@@ -60,15 +61,9 @@ def _layout_import_hint(file_path: str) -> str:
 
 
 class TestWriter:
-    """
-    Generates 1-2 pytest test functions targeting a specific uncovered branch.
+    """Generates pytest test functions targeting a specific uncovered branch."""
 
-    In offline mode, returns the sample_test.py fixture wrapped in a DraftTest.
-    In live mode, calls the LLM with context and an optional critique from the
-    Eval Agent if this is a retry after a REWRITE routing decision.
-    """
-
-    __test__ = False  # not a pytest collection target
+    __test__ = False
 
     def __init__(self, credentials: Credentials) -> None:
         self.creds = credentials
@@ -79,15 +74,6 @@ class TestWriter:
         context: ContextPayload,
         critique: str | None = None,
     ) -> DraftTest:
-        if self.creds.is_offline:
-            logger.info("[OFFLINE] TestWriter — returning fixture test for %s", gap.gap_id)
-            test_code = (_FIXTURES_DIR / "sample_test.py").read_text(encoding="utf-8")
-            return DraftTest(
-                test_code=test_code,
-                mocks_used=_extract_mocks(test_code),
-                target_branch=gap.branch,
-            )
-
         test_code = self._generate(gap, context, critique)
         return DraftTest(
             test_code=test_code,
@@ -107,10 +93,6 @@ class TestWriter:
                 f"# {name}\n{src}" for name, src in context.dependencies_code.items()
             )
 
-        # Branch trigger hint — Phase C. Extracted from the file's AST by the
-        # ContextArchitect / sandbox script. Tells TestWriter the exact condition
-        # gating the uncovered branch. This is the difference between guessing
-        # at inputs and choosing inputs that actually flip the target branch.
         hint_section = ""
         if context.branch_condition_hint:
             hint_section = (
@@ -124,15 +106,6 @@ class TestWriter:
 
         retry_section = ""
         if critique:
-            # Two critique flavors flow in here:
-            #   1. Eval rejection — e.g. "Mock completeness: missing patch for X"
-            #   2. Runtime failure from the sandbox — formatted with the prefix
-            #      "The previous attempt CRASHED at runtime..." or
-            #      "The previous attempt RAN SUCCESSFULLY but did not exercise..."
-            # The sandbox-feedback flavor is far more actionable because it
-            # carries actual stderr/stack traces from a real pytest run. Both
-            # formats funnel through the same retry_section — TestWriter just
-            # needs to take the feedback seriously and not regenerate the same test.
             retry_section = (
                 f"\n\nThis is a RETRY. Your previous attempt did not succeed:\n\n"
                 f"{critique}\n\n"

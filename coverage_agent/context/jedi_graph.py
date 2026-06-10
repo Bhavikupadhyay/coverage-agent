@@ -8,7 +8,7 @@ import jedi
 import litellm
 
 from coverage_agent.context.branch_conditions import extract_branch_condition_from_source
-from coverage_agent.contracts.schemas import ContextPayload
+from coverage_agent.contracts import ContextPayload
 
 logger = logging.getLogger(__name__)
 

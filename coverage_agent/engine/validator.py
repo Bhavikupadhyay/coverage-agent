@@ -1,25 +1,14 @@
 """
 EvalAgent — deterministic pre-execution gate.
 
-The sandbox is the ground truth for "does this test work." EvalAgent's only
-remaining job is to catch the cheap, obvious failures before we pay for a
-sandbox round-trip:
+Catches syntax errors and hallucinated imports before paying for an execution
+round-trip. No LLM call. The executor is the ground truth for whether a test
+works.
 
-  1. Syntax validity (ruff, falls back to ast.parse)
-  2. Import plausibility (ast + context payload + ruff F821)
-
-That's it. No LLM call. No assertion-quality scoring. No mock-completeness
-LLM. Those were forms of judgment that the assertion-quality LLM consistently
-got wrong on `psf/requests` benchmarks — they were the source of v3's
-false-positive 5/5 scores on tests that crashed at runtime.
-
-By design, this means well-formed-but-semantically-wrong tests will reach
-the sandbox. That's intentional: the sandbox can tell us they crashed in a
-way the LLM cannot, and the new execution_runner → test_writer retry edge
-in pipeline.py uses that stderr as the next critique.
-
-Strictness now lives on Credentials (`should_commit`, `max_retry_loops`) and
-controls the commit gate after execution, not the LLM gate before it.
+Routes:
+  - REWRITE          — syntax error
+  - RECONTEXTUALIZE  — unknown imports / undefined names
+  - EXECUTE          — clean; defer semantic judgment to the executor
 """
 from __future__ import annotations
 
@@ -33,7 +22,7 @@ import tempfile
 from pathlib import Path
 
 from coverage_agent.credentials import Credentials
-from coverage_agent.contracts.schemas import ContextPayload, CoverageGap, DraftTest, EvalResult
+from coverage_agent.contracts import ContextPayload, CoverageGap, DraftTest, EvalResult
 
 logger = logging.getLogger(__name__)
 
@@ -49,13 +38,10 @@ def _check_syntax(test_code: str) -> bool:
 
 
 def _ruff_lint(test_code: str) -> tuple[bool, list[str]]:
-    """
-    Runs ruff on test_code via subprocess.
-    Returns (syntax_valid, undefined_names).
+    """Runs ruff on test_code. Returns (syntax_valid, undefined_names).
 
-    F821 = undefined name (catches hallucinated identifiers that slip past
-    the import-plausibility check). Falls back to ast.parse if ruff isn't
-    on PATH.
+    F821 catches hallucinated identifiers. Falls back to ast.parse if ruff
+    is not on PATH.
     """
     try:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
@@ -70,7 +56,6 @@ def _ruff_lint(test_code: str) -> tuple[bool, list[str]]:
         os.unlink(tmp)
         diagnostics = json.loads(result.stdout or "[]")
         syntax_valid = not any(d.get("code") == "invalid-syntax" for d in diagnostics)
-        # F821 messages use backticks: "Undefined name `foo`"
         undefined_names = list({
             d["message"].split("`")[1]
             for d in diagnostics
@@ -85,7 +70,6 @@ def _ruff_lint(test_code: str) -> tuple[bool, list[str]]:
 
 
 def _extract_imports(test_code: str) -> list[str]:
-    """Returns top-level module names imported in the test code."""
     try:
         tree = ast.parse(test_code)
     except SyntaxError:
@@ -105,20 +89,8 @@ def _extract_imports(test_code: str) -> list[str]:
 def _find_unknown_imports(
     test_code: str, context: ContextPayload, gap: CoverageGap
 ) -> list[str]:
-    """
-    Returns imports that are neither stdlib nor plausibly known given the context.
-
-    Known modules include:
-    - All stdlib top-level names
-    - pytest / unittest / mock (universal test utilities)
-    - The top-level package of the file under test (e.g. "requests" from "requests/auth.py")
-    - Module roots extracted from dependency keys (e.g. "re" from "re.compile")
-    - Top-level imports appearing in context.primary_code (the excerpt shown to the writer)
-    """
     imported = _extract_imports(test_code)
 
-    # Target package root: "requests/auth.py" → "requests"
-    # Skip generic src-layout prefixes: "src/requests/auth.py" → "requests"
     _SRC_DIRS = {"src", "lib", "python", "source", "packages", "pkg"}
     _parts = Path(gap.file_path).parts if gap.file_path else ()
     target_pkg = next(
@@ -130,9 +102,6 @@ def _find_unknown_imports(
     known = _STDLIB_MODULES | {"pytest", "unittest", "mock"} | dep_module_roots
     if target_pkg:
         known.add(target_pkg)
-    # Imports already used in the excerpted target code are safe to use in tests
-    # (e.g. `certifi` in requests/certs.py) even when Jedi depth=0 omitted them
-    # from dependencies_code.
     known |= set(_extract_imports(context.primary_code))
 
     unknown = []
@@ -142,27 +111,11 @@ def _find_unknown_imports(
     return unknown
 
 
-# Constant filled into EvalResult.assertion_score so the schema (which still
-# requires 1..=5) doesn't need to change. The number itself is meaningless
-# now — the field is a vestige of the old LLM-gate design. The sandbox tells
-# us what we actually care about.
 _NEUTRAL_ASSERTION_SCORE = 3
 
 
 class EvalAgent:
-    """
-    Deterministic pre-execution gate. Catches syntax errors and hallucinated
-    imports before we pay for an E2B round-trip. Everything else routes to
-    EXECUTE and lets the sandbox tell us the truth.
-
-    Routes:
-      - REWRITE        — syntax error (ast.parse / ruff `invalid-syntax`)
-      - RECONTEXTUALIZE — unknown imports / undefined names that look like missing context
-      - EXECUTE        — clean syntactically, defer semantic judgment to the sandbox
-
-    In offline mode, route=EXECUTE with passing scores so the full pipeline
-    can be exercised in tests without an LLM or sandbox.
-    """
+    """Deterministic pre-execution gate."""
 
     def __init__(self, credentials: Credentials) -> None:
         self.creds = credentials
@@ -173,7 +126,6 @@ class EvalAgent:
         context: ContextPayload,
         gap: CoverageGap,
     ) -> EvalResult:
-        # --- 1. Syntax check (ruff, falls back to ast.parse) ---
         syntax_valid, ruff_undefined = _ruff_lint(draft.test_code)
         if not syntax_valid:
             logger.info("EvalAgent: syntax invalid for %s — routing REWRITE", gap.gap_id)
@@ -186,9 +138,7 @@ class EvalAgent:
                 route="REWRITE",
             )
 
-        # --- 2. Import plausibility (deterministic) ---
         unknown_imports = _find_unknown_imports(draft.test_code, context, gap)
-        # Merge ruff F821 undefined names not already caught by import analysis
         for name in ruff_undefined:
             if name not in unknown_imports:
                 unknown_imports.append(name)
@@ -212,14 +162,7 @@ class EvalAgent:
                 route="RECONTEXTUALIZE",
             )
 
-        # --- 3. Everything else: defer to sandbox ---
-        # The sandbox can tell us whether the test runs, whether assertions
-        # pass, whether the target branch fires. An LLM cannot do any of
-        # that reliably and was the source of v3's false-positive 5/5 scores.
-        if self.creds.is_offline:
-            logger.info("[OFFLINE] EvalAgent — routing EXECUTE for %s", gap.gap_id)
-        else:
-            logger.info("EvalAgent: gap=%s syntax=OK imports=OK → EXECUTE", gap.gap_id)
+        logger.info("EvalAgent: gap=%s syntax=OK imports=OK → EXECUTE", gap.gap_id)
 
         return EvalResult(
             syntax_valid=True,
