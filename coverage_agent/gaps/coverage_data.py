@@ -247,7 +247,8 @@ def parse_coverage(
                 target_symbol=containing_symbol,
                 branch=BranchGap(from_line=from_line, to_line=to_line),
                 surrounding_lines=surrounding,
-                priority_score=0.0,
+                kind="branch",
+                origin="full",
                 gap_id=gap_id,
             )
             gaps.append(gap)

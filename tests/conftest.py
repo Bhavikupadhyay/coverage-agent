@@ -31,7 +31,8 @@ def sample_gap() -> CoverageGap:
         target_symbol="handle_auth",
         branch=BranchGap(from_line=47, to_line=52),
         surrounding_lines=list(range(40, 70)),
-        priority_score=0.0,
+        kind="branch",
+        origin="full",
         gap_id="requests/auth.py:47->52",
     )
 

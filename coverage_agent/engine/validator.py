@@ -22,7 +22,7 @@ import tempfile
 from pathlib import Path
 
 from coverage_agent.credentials import Credentials
-from coverage_agent.contracts import ContextPayload, CoverageGap, DraftTest, EvalResult
+from coverage_agent.contracts import ContextPayload, CoverageGap, DraftTest, ValidationResult
 
 logger = logging.getLogger(__name__)
 
@@ -111,9 +111,6 @@ def _find_unknown_imports(
     return unknown
 
 
-_NEUTRAL_ASSERTION_SCORE = 3
-
-
 class EvalAgent:
     """Deterministic pre-execution gate."""
 
@@ -125,15 +122,13 @@ class EvalAgent:
         draft: DraftTest,
         context: ContextPayload,
         gap: CoverageGap,
-    ) -> EvalResult:
+    ) -> ValidationResult:
         syntax_valid, ruff_undefined = _ruff_lint(draft.test_code)
         if not syntax_valid:
             logger.info("EvalAgent: syntax invalid for %s — routing REWRITE", gap.gap_id)
-            return EvalResult(
+            return ValidationResult(
                 syntax_valid=False,
                 unknown_imports=[],
-                mock_complete=False,
-                assertion_score=1,
                 critique="Test code has syntax errors. Fix all syntax errors before proceeding.",
                 route="REWRITE",
             )
@@ -153,22 +148,18 @@ class EvalAgent:
                 "EvalAgent: gap=%s unknown_imports=%s → RECONTEXTUALIZE",
                 gap.gap_id, unknown_imports,
             )
-            return EvalResult(
+            return ValidationResult(
                 syntax_valid=True,
                 unknown_imports=unknown_imports,
-                mock_complete=True,
-                assertion_score=_NEUTRAL_ASSERTION_SCORE,
                 critique=critique,
                 route="RECONTEXTUALIZE",
             )
 
         logger.info("EvalAgent: gap=%s syntax=OK imports=OK → EXECUTE", gap.gap_id)
 
-        return EvalResult(
+        return ValidationResult(
             syntax_valid=True,
             unknown_imports=[],
-            mock_complete=True,
-            assertion_score=_NEUTRAL_ASSERTION_SCORE,
             critique="",
             route="EXECUTE",
         )

@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Literal, Optional
 from pydantic import BaseModel, Field
 
@@ -14,7 +15,8 @@ class CoverageGap(BaseModel):
     target_symbol: str = Field(..., description="Function or method name containing the gap")
     branch: BranchGap = Field(..., description="The specific uncovered branch arc")
     surrounding_lines: list[int] = Field(..., description="Line numbers of the enclosing function for context")
-    priority_score: float = Field(..., ge=0.0, le=1.0, description="Priority (1.0 = highest)")
+    kind: Literal["branch", "line", "function"] = Field(default="branch", description="Gap kind")
+    origin: Literal["diff", "full"] = Field(default="full", description="How this gap was selected")
     gap_id: str = Field(..., description="Unique ID: {file_path}:{from_line}->{to_line}")
 
 
@@ -41,11 +43,10 @@ class DraftTest(BaseModel):
     target_branch: BranchGap = Field(..., description="The branch this test is designed to cover")
 
 
-class EvalResult(BaseModel):
+class ValidationResult(BaseModel):
+    """Deterministic pre-execution gate result."""
     syntax_valid: bool = Field(..., description="Passed ast.parse() check")
     unknown_imports: list[str] = Field(default_factory=list, description="Imports not found in context or stdlib")
-    mock_complete: bool = Field(..., description="All external IO/network deps are mocked")
-    assertion_score: int = Field(..., ge=1, le=5, description="Assertion quality placeholder (3 = neutral)")
     critique: str = Field(..., description="Actionable feedback for the writer")
     route: str = Field(..., pattern="^(EXECUTE|REWRITE|RECONTEXTUALIZE)$")
 
@@ -53,7 +54,8 @@ class EvalResult(BaseModel):
 class ExecutionResult(BaseModel):
     execution_success: bool = Field(..., description="pytest exited 0")
     target_branch_hit: bool = Field(..., description="The specific target branch was newly covered")
-    coverage_delta: float = Field(..., description="Percentage point increase in overall branch coverage")
+    targets_hit: int = Field(default=0, description="Number of gap target arcs newly hit")
+    targets_total: int = Field(default=0, description="Total gap target arcs expected")
     stderr_trace: str = Field(default="", description="Full stderr if execution failed")
     flaky: bool = Field(default=False, description="True if test passed sometimes and failed others")
     is_system_error: bool = Field(
@@ -62,14 +64,28 @@ class ExecutionResult(BaseModel):
     )
 
 
+class ReActStep(BaseModel):
+    """One step in a ReAct tool-calling loop."""
+    tool_name: str
+    tool_input: dict = Field(default_factory=dict)
+    tool_output: str = ""
+    tokens_used: int = 0
+
+
+class AgentTrace(BaseModel):
+    """Full trace of a ReAct writer run for one gap."""
+    gap_id: str
+    steps: list[ReActStep] = Field(default_factory=list)
+
+
 class GapResult(BaseModel):
     """Aggregated result for one gap."""
     gap: CoverageGap
     skipped: bool
     loops_taken: int
-    phase1_scores: Optional[EvalResult]
-    phase2_scores: Optional[ExecutionResult]
-    final_test_committed: bool
+    phase1_scores: Optional[ValidationResult] = None
+    phase2_scores: Optional[ExecutionResult] = None
+    accepted: bool = False
     test_code: Optional[str] = None
     skip_reason: str = ""
     gap_difficulty: Literal["easy", "hard"] = Field(default="easy")
@@ -87,7 +103,16 @@ class RegressionResult(BaseModel):
     skipped: bool = Field(default=False, description="True if no accepted tests existed")
 
 
-class RunSummary(BaseModel):
-    """Narrative for a completed run."""
-    pr_description: str = Field(..., description="Short, markdown, ~120 words. Drop into a PR body.")
-    full_summary: str = Field(..., description="Longer narrative covering what was accepted, skipped, and why.")
+class RunReport(BaseModel):
+    """Top-level output schema: consumed by CLI JSON output, PR comment renderer, and dashboard."""
+    repo: str = ""
+    scope: Literal["full", "diff"] = "full"
+    model: str = ""
+    gaps_found: int = 0
+    gaps_accepted: int = 0
+    tests_accepted: int = 0
+    total_cost_usd: float = 0.0
+    gap_results: list[GapResult] = Field(default_factory=list)
+    agent_traces: list[AgentTrace] = Field(default_factory=list)
+    regression: Optional[RegressionResult] = None
+    created_at: datetime = Field(default_factory=datetime.utcnow)
