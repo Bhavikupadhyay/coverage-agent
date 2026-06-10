@@ -42,9 +42,14 @@ def run(
     model: str = typer.Option("", help="LiteLLM model ID (overrides config/env)"),
     config_path: str = typer.Option("", "--config", help="Path to .coverage-agent.yml"),
     output: str = typer.Option("", help="Write RunReport JSON to this path"),
+    repo: str = typer.Option("", help="GitHub URL or local path to target repo (clones if URL)"),
     verbose: bool = typer.Option(False, "-v", help="Verbose logging"),
 ) -> None:
     """Run the coverage agent on the current repo."""
+    import os
+    import shutil
+    import tempfile
+
     if verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
@@ -61,7 +66,6 @@ def run(
         cfg = cfg.model_copy(update={"model": model})
 
     # Override env model so credentials.for_cli_env() picks it up.
-    import os
     if cfg.model and cfg.model != DEFAULT_MODEL:
         os.environ.setdefault("COVERAGE_AGENT_MODEL", cfg.model)
 
@@ -79,16 +83,89 @@ def run(
     from coverage_agent.engine.regression import RegressionGuard
     from coverage_agent.report.run_report import serialize_run_report
 
-    repo_root = str(Path.cwd())
+    # ---- Resolve repo_root ----
+    _tmp_clone: Optional[str] = None
+    if repo:
+        if repo.startswith("http://") or repo.startswith("https://") or repo.startswith("git@"):
+            _tmp_clone = tempfile.mkdtemp(prefix="coverage-agent-")
+            console.print(f"Cloning {repo} …")
+            import subprocess as _sp
+            result = _sp.run(
+                ["git", "clone", "--depth=1", repo, _tmp_clone],
+                capture_output=True, text=True,
+            )
+            if result.returncode != 0:
+                err_console.print(f"[red]git clone failed:[/red]\n{result.stderr.strip()}")
+                shutil.rmtree(_tmp_clone, ignore_errors=True)
+                raise typer.Exit(1)
+            repo_root = _tmp_clone
+        else:
+            p = Path(repo).resolve()
+            if not p.exists():
+                err_console.print(f"[red]Path not found:[/red] {repo}")
+                raise typer.Exit(1)
+            if not (p / ".git").exists():
+                err_console.print(f"[red]Not a git repo:[/red] {p}")
+                raise typer.Exit(1)
+            repo_root = str(p)
+    else:
+        repo_root = str(Path.cwd())
 
-    # ---- Acquire coverage data ----
-    cov_path = cfg.coverage_file
+    try:
+        _run_pipeline(
+            repo_root=repo_root,
+            cfg=cfg,
+            creds=creds,
+            coverage_file=coverage_file,
+            output=output,
+            run_pipeline=run_pipeline,
+            select_gaps=select_gaps,
+            parse_coverage=parse_coverage,
+            compute_diff_gaps=compute_diff_gaps,
+            load_coverage_file=load_coverage_file,
+            RegressionGuard=RegressionGuard,
+        )
+    finally:
+        if _tmp_clone:
+            shutil.rmtree(_tmp_clone, ignore_errors=True)
+
+
+def _run_pipeline(
+    repo_root: str,
+    cfg,
+    creds,
+    coverage_file: str,
+    output: str,
+    run_pipeline,
+    select_gaps,
+    parse_coverage,
+    compute_diff_gaps,
+    load_coverage_file,
+    RegressionGuard,
+) -> None:
+    import subprocess as _sp
+
+    # ---- Auto-run coverage baseline if no coverage file provided ----
+    cov_path = cfg.coverage_file or coverage_file
     if not cov_path:
-        # Auto-detect: try common names in cwd.
         for candidate in (".coverage", "coverage.json", "coverage.xml"):
             if Path(repo_root, candidate).exists():
                 cov_path = candidate
                 break
+    if not cov_path:
+        console.print("No coverage file found — running [bold]coverage run --branch -m pytest[/bold] …")
+        result = _sp.run(
+            ["coverage", "run", "--branch", "-m", "pytest", "-q"],
+            cwd=repo_root,
+        )
+        if result.returncode not in (0, 1):
+            err_console.print("[red]coverage run failed — cannot continue.[/red]")
+            raise typer.Exit(1)
+        for candidate in (".coverage", "coverage.json", "coverage.xml"):
+            if Path(repo_root, candidate).exists():
+                cov_path = candidate
+                break
+
     if not cov_path:
         err_console.print(
             "[red]No coverage file found.[/red] Run your tests with "
@@ -97,7 +174,8 @@ def run(
         raise typer.Exit(1)
 
     try:
-        coverage_data = load_coverage_file(str(Path(repo_root) / cov_path) if not Path(cov_path).is_absolute() else cov_path)
+        abs_cov = str(Path(repo_root) / cov_path) if not Path(cov_path).is_absolute() else cov_path
+        coverage_data = load_coverage_file(abs_cov)
     except Exception as exc:
         err_console.print(f"[red]Failed to load coverage file:[/red] {exc}")
         raise typer.Exit(1)
@@ -108,11 +186,13 @@ def run(
     else:
         all_gaps = parse_coverage(coverage_data, repo_root=repo_root, ignore_patterns=cfg.exclude)
 
-    gaps = select_gaps(all_gaps, max_gaps=cfg.max_gaps, exclude=cfg.exclude)
+    # Pull up to 2× the target so skipped gaps can be replaced from the tail.
+    target_count = cfg.max_gaps
+    candidate_gaps = select_gaps(all_gaps, max_gaps=target_count * 2, exclude=cfg.exclude)
 
-    console.print(f"[bold]coverage-agent[/bold] scope={cfg.scope} gaps_found={len(all_gaps)} selected={len(gaps)}")
+    console.print(f"[bold]coverage-agent[/bold] scope={cfg.scope} gaps_found={len(all_gaps)} selected={len(candidate_gaps)}")
 
-    if not gaps:
+    if not candidate_gaps:
         console.print("[green]No actionable gaps found — nothing to do.[/green]")
         report = RunReport(
             scope=cfg.scope,
@@ -124,14 +204,23 @@ def run(
         _write_output(report, output)
         return
 
-    # ---- Run engine per gap ----
+    # ---- Run engine per gap (with skip substitution) ----
     gap_results = []
     agent_traces = []
+    accepted_count = 0
+    attempted = 0
 
-    for i, gap in enumerate(gaps, 1):
-        console.print(f"  [{i}/{len(gaps)}] {gap.gap_id} ({gap.kind})")
+    from coverage_agent.evals.braintrust_logger import log_gap_result
+    import datetime
+    run_id = datetime.datetime.utcnow().strftime("run-%Y%m%dT%H%M%S")
+
+    for gap in candidate_gaps:
+        if accepted_count >= target_count or attempted >= target_count * 2:
+            break
+        attempted += 1
+        console.print(f"  [{attempted}] {gap.gap_id} ({gap.kind})")
         try:
-            gap_result, _ = run_pipeline(
+            gap_result, final_state = run_pipeline(
                 gap=gap,
                 credentials=creds,
                 config=cfg,
@@ -142,8 +231,10 @@ def run(
             err_console.print(f"  [yellow]Warning:[/yellow] gap {gap.gap_id} failed: {exc}")
             continue
         gap_results.append(gap_result)
+        log_gap_result(gap_result, final_state.get("context"), run_id=run_id)
 
         if gap_result.accepted and gap_result.test_code:
+            accepted_count += 1
             tests_dir = Path(repo_root) / cfg.tests_dir
             tests_dir.mkdir(parents=True, exist_ok=True)
             from coverage_agent.engine.regression import _filename_for

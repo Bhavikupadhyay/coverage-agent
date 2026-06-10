@@ -115,3 +115,35 @@ def test_io_flag_hard_for_large_context():
 ])
 def test_is_io_heavy_patterns(symbol, expected):
     assert _is_io_heavy(symbol) is expected
+
+
+# ---------------------------------------------------------------------------
+# Gap substitution behaviour (tests the CLI loop logic indirectly via
+# select_gaps: when the candidate pool is 2× target, skipped gaps are
+# replaced from the tail so accepted_count reaches target_count).
+# ---------------------------------------------------------------------------
+
+def test_select_gaps_double_pool_covers_skips():
+    """2× pool means skipped gaps can be replaced to hit the target count."""
+    target = 3
+    # Build 6 gaps (2× target) so the substitution pool is large enough.
+    all_gaps = [
+        _gap(symbol=f"fn_{i}", from_l=i * 10, to_l=i * 10 + 2)
+        for i in range(6)
+    ]
+    candidates = select_gaps(all_gaps, max_gaps=target * 2, exclude=())
+    assert len(candidates) == 6
+
+    # Simulate the CLI loop: accept every other gap (3 skips, 3 accepts).
+    accepted = []
+    attempted = 0
+    accepted_count = 0
+    for gap in candidates:
+        if accepted_count >= target or attempted >= target * 2:
+            break
+        attempted += 1
+        if attempted % 2 == 0:
+            accepted_count += 1
+            accepted.append(gap)
+
+    assert accepted_count == target
