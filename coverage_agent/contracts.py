@@ -83,8 +83,8 @@ class GapResult(BaseModel):
     gap: CoverageGap
     skipped: bool
     loops_taken: int
-    phase1_scores: Optional[ValidationResult] = None
-    phase2_scores: Optional[ExecutionResult] = None
+    validation: Optional[ValidationResult] = None
+    execution: Optional[ExecutionResult] = None
     accepted: bool = False
     test_code: Optional[str] = None
     skip_reason: str = ""

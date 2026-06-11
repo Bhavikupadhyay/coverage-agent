@@ -26,8 +26,8 @@ def _make_gap_result(committed: bool, test_code: str = "def test_x(): pass") -> 
         gap=gap,
         skipped=not committed,
         loops_taken=1,
-        phase1_scores=None,
-        phase2_scores=(
+        validation=None,
+        execution=(
             ExecutionResult(execution_success=True, target_branch_hit=True, targets_hit=1, targets_total=1)
             if committed else None
         ),
@@ -48,7 +48,7 @@ def test_filename_is_stable_and_collision_free():
             origin="full",
             gap_id="pkg/auth.py:20->22",
         ),
-        skipped=False, loops_taken=1, phase1_scores=None, phase2_scores=None,
+        skipped=False, loops_taken=1, validation=None, execution=None,
         accepted=True, test_code="x",
     )
     fa = _filename_for(a)
@@ -132,7 +132,7 @@ def test_subprocess_path_writes_tests_and_runs_suite(creds, tmp_path, monkeypatc
         gap_id="pkg/auth.py:20->22",
     )
     result2 = GapResult(gap=gap2, skipped=False, loops_taken=1,
-                        phase1_scores=None, phase2_scores=None,
+                        validation=None, execution=None,
                         accepted=True, test_code="def test_y(): pass")
 
     import coverage_agent.engine.regression as reg_mod

@@ -1,4 +1,4 @@
-"""Phase C: branch-condition AST extractor.
+"""Branch-condition AST extractor.
 
 The whole point is to hand TestWriter the exact condition that gates an
 uncovered branch, so it can pick inputs that trigger it. These tests pin

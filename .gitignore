@@ -49,9 +49,8 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
-# Benchmark outputs
+# Benchmark working state. Run outputs stay local — only final, real-key proof
+# artifacts get published, added deliberately with `git add -f` on key day.
 eval_dataset.jsonl
-benchmarks/*/
-!benchmarks/requests/
-!benchmarks/pydantic/
-!benchmarks/click/
+benchmarks/.clones/
+benchmarks/results/

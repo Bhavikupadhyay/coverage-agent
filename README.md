@@ -63,14 +63,12 @@ uv sync
 # Set a model key (Gemini free tier works)
 export GEMINI_API_KEY=<your-key>
 
-# Run on the current repo (auto-runs coverage if no .coverage file found)
+# Run on the current checkout (auto-runs coverage if no .coverage file found)
 coverage-agent run --scope full --max-gaps 5
 
-# Run on an external repo
-coverage-agent run --repo https://github.com/un33k/python-slugify --max-gaps 5
-
-# Run on a local checkout
-coverage-agent run --repo /path/to/repo --max-gaps 5
+# Only target the changes since a ref (a branch, a SHA, or a commit range base)
+coverage-agent run --scope diff --base origin/main
+coverage-agent run --scope diff --base HEAD~3
 
 # Write a RunReport JSON
 coverage-agent run --scope full --max-gaps 5 --output report.json
@@ -113,23 +111,14 @@ coverage-agent models   # prints the full registry table
 
 ## Benchmarks
 
-Raw JSON in [`benchmarks/results/`](benchmarks/results/).
-
-| Repository | Gaps Targeted | Tests Committed | Skipped | Branch Hit Rate | Coverage Delta | Avg Loops | LLM Cost |
-|---|---|---|---|---|---|---|---|
-| `psf/requests`     | — | — | — | — | — | — | — |
-| `pydantic/pydantic`| — | — | — | — | — | — | — |
-| `pallets/click`    | — | — | — | — | — | — | — |
-| **Total**          | — | — | — | — | — | — | — |
+Benchmark numbers are published only from real, reproducible runs — raw `RunReport` JSON lands in [`benchmarks/results/`](benchmarks/results/) as runs complete. No projected numbers.
 
 ## Tests
 
 ```bash
 uv run pytest -q
-# 115 tests, ~6 seconds, no network calls
+# 104 tests, ~5 seconds, no network calls
 ```
-
-Optional Braintrust eval logging — set `BRAINTRUST_API_KEY` before a run and every gap result is logged to the `coverage-agent` project automatically.
 
 ## License
 

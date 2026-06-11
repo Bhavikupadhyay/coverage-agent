@@ -161,7 +161,7 @@ def build_context(
 
     tokens_used = _count_tokens(primary_code) + sum(_count_tokens(v) for v in dependencies.values())
 
-    # Best-effort branch condition extraction (Phase C). Hands TestWriter the
+    # Best-effort branch condition extraction. Hands TestWriter the
     # condition controlling the target branch so it can pick inputs that
     # actually trigger it. Silently None on extraction failure — the pipeline
     # works fine without the hint, it's a quality boost.
