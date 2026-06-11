@@ -31,7 +31,12 @@ class AgentConfig(BaseModel):
     scope: Literal["full", "diff"] = "full"
     paths: list[str] = Field(default_factory=list)
     exclude: list[str] = Field(
-        default_factory=lambda: ["**/migrations/**", "**/conftest.py"]
+        default_factory=lambda: [
+            "**/migrations/**",
+            "**/conftest.py",
+            "tests/**",
+            "test_*.py",
+        ]
     )
     tests_dir: str = "tests/generated"
     commit_mode: Literal["comment", "commit", "pr"] = "comment"

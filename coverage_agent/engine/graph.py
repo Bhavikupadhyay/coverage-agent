@@ -49,7 +49,7 @@ class PipelineState(TypedDict):
 
 def _make_context_architect_node(credentials: Credentials):
     def _context_architect_node(state: PipelineState) -> dict:
-        from coverage_agent.context.jedi_graph import JediContextGraph
+        from coverage_agent.context.jedi_graph import build_context
         from coverage_agent.context.branch_conditions import extract_branch_condition_from_source
         from pathlib import Path
 
@@ -57,8 +57,13 @@ def _make_context_architect_node(credentials: Credentials):
         gap = state["target_gap"]
         repo_root = state["repo_path"] or "."
 
-        jedi = JediContextGraph(repo_root=repo_root)
-        context = jedi.build_context(gap, depth_override=depth)
+        context = build_context(
+            file_path=gap.file_path,
+            target_symbol=gap.target_symbol,
+            depth=depth,
+            repo_root=repo_root,
+            from_line=gap.branch.from_line,
+        )
 
         if context.branch_condition_hint is None:
             try:

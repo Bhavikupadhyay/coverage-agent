@@ -207,6 +207,21 @@ def _is_trivial_gap(file_path: str, from_line: int, containing_symbol: str, repo
 # Main parser
 # ---------------------------------------------------------------------------
 
+def _normalize_file_path(raw_path: str, repo_root: str) -> Optional[str]:
+    """Converts an absolute or relative path to a repo-relative path.
+
+    Returns None if the path is outside the repo root (e.g. site-packages).
+    """
+    try:
+        p = Path(raw_path)
+        root = Path(repo_root).resolve()
+        abs_p = p if p.is_absolute() else (root / p)
+        abs_p = abs_p.resolve()
+        return str(abs_p.relative_to(root))
+    except ValueError:
+        return None
+
+
 def parse_coverage(
     coverage_json: dict,
     repo_root: str = ".",
@@ -216,11 +231,19 @@ def parse_coverage(
 
     Accepts the dict returned by load_coverage_file() or a raw
     coverage.py --branch --json export.
+
+    Absolute paths (as stored by the coverage binary) are normalized to
+    repo-relative paths. Files outside the repo root are skipped.
     """
     gaps: list[CoverageGap] = []
     files: dict = coverage_json.get("files", {})
 
-    for file_path, file_data in files.items():
+    for raw_path, file_data in files.items():
+        file_path = _normalize_file_path(raw_path, repo_root)
+        if file_path is None:
+            logger.debug("Skipping out-of-repo file: %s", raw_path)
+            continue
+
         if ignore_patterns and _file_matches_patterns(file_path, ignore_patterns):
             logger.debug("Ignoring %s (matched ignore pattern)", file_path)
             continue
