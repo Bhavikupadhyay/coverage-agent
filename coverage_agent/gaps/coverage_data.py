@@ -48,27 +48,37 @@ def load_coverage_file(path: str) -> dict:
 
 
 def _load_coverage_datafile(path: str) -> dict:
-    """Loads a .coverage binary file via the coverage API."""
+    """Loads a .coverage binary file by delegating to 'coverage json'.
+
+    Converts the binary .coverage data file to the normalized JSON shape by
+    running 'coverage json' in a subprocess. This correctly computes
+    missing_branches via coverage.py's own analysis logic rather than
+    attempting to reconstruct missing arcs from executed-arc data.
+    """
+    import json
+    import subprocess
+    import sys
+    import tempfile
+
+    p = Path(path)
     try:
-        import coverage as coverage_module
-        cov = coverage_module.Coverage(data_file=path)
-        cov.load()
-        data = cov.get_data()
-        files: dict = {}
-        for measured_file in data.measured_files():
-            arc_missing: list = []
-            try:
-                arcs = data.arcs(measured_file) or []
-                executed = {(f, t) for f, t in arcs}
-                # Get all possible arcs to find missing ones; fall back to
-                # reporting missing_lines from line data when arc data is absent.
-                arc_missing = [
-                    [f, t] for f, t in arcs if f > 0 and t > 0
-                ]
-            except Exception:
-                pass
-            files[measured_file] = {"missing_branches": arc_missing}
-        return {"files": files, "totals": {"percent_covered": 0.0}}
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
+            tmp_json = tmp.name
+
+        result = subprocess.run(
+            [sys.executable, "-m", "coverage", "json",
+             f"--data-file={path}", "-o", tmp_json],
+            capture_output=True,
+            text=True,
+            cwd=str(p.parent),
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"coverage json failed for {path}: {result.stderr.strip()}"
+            )
+        data = json.loads(Path(tmp_json).read_text(encoding="utf-8"))
+        Path(tmp_json).unlink(missing_ok=True)
+        return data
     except Exception as exc:
         logger.error("Failed to load .coverage data file %s: %s", path, exc)
         raise
