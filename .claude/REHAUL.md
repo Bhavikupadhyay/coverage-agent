@@ -119,7 +119,7 @@ The **Executor remains a separate deterministic gate** — the agent's own runs 
 - Real PR through the Action: comment mode, then commit mode; verify the comment updates (not duplicates) on PR edit.
 - Measured numbers → README scorecard; PyPI publish; tag v1; Marketplace listing.
 
-**4. Afterward, optional:** dashboard; per-model measured comparison (free tier vs paid) appended to `benchmarks/results/history.jsonl` by a nightly acceptance run; ReAct-vs-single-shot ablation for the README.
+**4. Afterward, optional:** dashboard; per-model measured comparison (free tier vs paid) appended to `benchmarks/results/history.jsonl` by a nightly acceptance run; ReAct-vs-single-shot ablation for the README; further infra improvements per `.claude/IMPROVEMENTS.md` (gap clustering, conversation continuity, prompt caching, concurrency, run resume — the cost ledger there is the one item pulled forward into key day).
 
 ---
 
