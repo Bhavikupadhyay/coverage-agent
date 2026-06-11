@@ -10,8 +10,6 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import Optional
-
 import typer
 from rich.console import Console
 from rich.table import Table
@@ -37,18 +35,24 @@ logging.basicConfig(
 @app.command()
 def run(
     scope: str = typer.Option("full", help="Gap scope: full or diff"),
+    base: str = typer.Option(
+        "", help="Diff scope only: git ref to diff against (e.g. origin/main, HEAD~3, a SHA). "
+        "Defaults to the merge-base with origin/main or origin/master."
+    ),
     max_gaps: int = typer.Option(0, help="Max gaps to target (0 = use config)"),
     coverage_file: str = typer.Option("", help="Path to .coverage, coverage.json, or coverage.xml"),
     model: str = typer.Option("", help="LiteLLM model ID (overrides config/env)"),
     config_path: str = typer.Option("", "--config", help="Path to .coverage-agent.yml"),
     output: str = typer.Option("", help="Write RunReport JSON to this path"),
-    repo: str = typer.Option("", help="GitHub URL or local path to target repo (clones if URL)"),
     verbose: bool = typer.Option(False, "-v", help="Verbose logging"),
 ) -> None:
-    """Run the coverage agent on the current repo."""
+    """Run the coverage agent on the current checkout.
+
+    Runs in the current working directory's git checkout. Check out the
+    branch or commit you want to target before running; use --scope diff
+    with --base to target only the changes since a ref.
+    """
     import os
-    import shutil
-    import tempfile
 
     if verbose:
         logging.getLogger().setLevel(logging.DEBUG)
@@ -83,51 +87,20 @@ def run(
     from coverage_agent.engine.regression import RegressionGuard
     from coverage_agent.report.run_report import serialize_run_report
 
-    # ---- Resolve repo_root ----
-    _tmp_clone: Optional[str] = None
-    if repo:
-        if repo.startswith("http://") or repo.startswith("https://") or repo.startswith("git@"):
-            _tmp_clone = tempfile.mkdtemp(prefix="coverage-agent-")
-            console.print(f"Cloning {repo} …")
-            import subprocess as _sp
-            result = _sp.run(
-                ["git", "clone", "--depth=1", repo, _tmp_clone],
-                capture_output=True, text=True,
-            )
-            if result.returncode != 0:
-                err_console.print(f"[red]git clone failed:[/red]\n{result.stderr.strip()}")
-                shutil.rmtree(_tmp_clone, ignore_errors=True)
-                raise typer.Exit(1)
-            repo_root = _tmp_clone
-        else:
-            p = Path(repo).resolve()
-            if not p.exists():
-                err_console.print(f"[red]Path not found:[/red] {repo}")
-                raise typer.Exit(1)
-            if not (p / ".git").exists():
-                err_console.print(f"[red]Not a git repo:[/red] {p}")
-                raise typer.Exit(1)
-            repo_root = str(p)
-    else:
-        repo_root = str(Path.cwd())
-
-    try:
-        _run_pipeline(
-            repo_root=repo_root,
-            cfg=cfg,
-            creds=creds,
-            coverage_file=coverage_file,
-            output=output,
-            run_pipeline=run_pipeline,
-            select_gaps=select_gaps,
-            parse_coverage=parse_coverage,
-            compute_diff_gaps=compute_diff_gaps,
-            load_coverage_file=load_coverage_file,
-            RegressionGuard=RegressionGuard,
-        )
-    finally:
-        if _tmp_clone:
-            shutil.rmtree(_tmp_clone, ignore_errors=True)
+    _run_pipeline(
+        repo_root=str(Path.cwd()),
+        cfg=cfg,
+        creds=creds,
+        coverage_file=coverage_file,
+        base_ref=base,
+        output=output,
+        run_pipeline=run_pipeline,
+        select_gaps=select_gaps,
+        parse_coverage=parse_coverage,
+        compute_diff_gaps=compute_diff_gaps,
+        load_coverage_file=load_coverage_file,
+        RegressionGuard=RegressionGuard,
+    )
 
 
 def _run_pipeline(
@@ -135,6 +108,7 @@ def _run_pipeline(
     cfg,
     creds,
     coverage_file: str,
+    base_ref: str,
     output: str,
     run_pipeline,
     select_gaps,
@@ -182,7 +156,9 @@ def _run_pipeline(
 
     # ---- Select gaps ----
     if cfg.scope == "diff":
-        all_gaps = compute_diff_gaps(coverage_data, repo_root=repo_root, exclude=cfg.exclude)
+        all_gaps = compute_diff_gaps(
+            coverage_data, repo_root=repo_root, base_ref=base_ref, exclude=cfg.exclude
+        )
     else:
         all_gaps = parse_coverage(coverage_data, repo_root=repo_root, ignore_patterns=cfg.exclude)
 
@@ -210,10 +186,6 @@ def _run_pipeline(
     accepted_count = 0
     attempted = 0
 
-    from coverage_agent.evals.braintrust_logger import log_gap_result
-    import datetime
-    run_id = datetime.datetime.utcnow().strftime("run-%Y%m%dT%H%M%S")
-
     for gap in candidate_gaps:
         if accepted_count >= target_count or attempted >= target_count * 2:
             break
@@ -231,7 +203,6 @@ def _run_pipeline(
             err_console.print(f"  [yellow]Warning:[/yellow] gap {gap.gap_id} failed: {exc}")
             continue
         gap_results.append(gap_result)
-        log_gap_result(gap_result, final_state.get("context"), run_id=run_id)
 
         if gap_result.accepted and gap_result.test_code:
             accepted_count += 1
