@@ -21,7 +21,6 @@ from coverage_agent.contracts import (
 )
 from coverage_agent.credentials import Credentials
 from coverage_agent.config import AgentConfig
-from coverage_agent.engine.executor import _cluster_arc_store
 
 
 # ---------------------------------------------------------------------------
@@ -75,7 +74,7 @@ def test_run_pipeline_cluster_single_gap_accepted(tmp_path, monkeypatch):
 
     with patch("litellm.completion", side_effect=_fake_completion()), \
          patch("coverage_agent.engine.executor._run_once",
-               return_value=_mock_exec_result(True, True)):
+               return_value=(_mock_exec_result(True, True), {})):
 
         from coverage_agent.engine.graph import run_pipeline_cluster
         results, _ = run_pipeline_cluster(
@@ -96,7 +95,7 @@ def test_run_pipeline_cluster_single_gap_skipped(tmp_path, monkeypatch):
 
     with patch("litellm.completion", side_effect=_fake_completion()), \
          patch("coverage_agent.engine.executor._run_once",
-               return_value=_mock_exec_result(True, False)):
+               return_value=(_mock_exec_result(True, False), {})):
 
         from coverage_agent.engine.graph import run_pipeline_cluster
         results, _ = run_pipeline_cluster(
@@ -122,11 +121,11 @@ def test_run_pipeline_cluster_partial_acceptance(tmp_path, monkeypatch):
     cluster = [g1, g2]
 
     base_exec = _mock_exec_result(True, True)   # any-hit → keep test
-    # Inject per-arc data: g1 hit, g2 missed.
-    _cluster_arc_store[id(base_exec)] = {(35, 37): True, (37, 38): False}
+    # Per-arc data: g1 hit, g2 missed — returned by the execution itself.
+    arc_hits = {(35, 37): True, (37, 38): False}
 
     with patch("litellm.completion", side_effect=_fake_completion()), \
-         patch("coverage_agent.engine.executor._run_once", return_value=base_exec):
+         patch("coverage_agent.engine.executor._run_once", return_value=(base_exec, arc_hits)):
 
         from coverage_agent.engine.graph import run_pipeline_cluster
         results, _ = run_pipeline_cluster(
@@ -179,7 +178,7 @@ def test_execution_runner_critique_names_missed_arcs(tmp_path, monkeypatch):
     def _fake_run_once(*args, **kwargs):
         run_count[0] += 1
         # Always return no-hit so the pipeline goes through the retry branch.
-        return exec_no_hit
+        return exec_no_hit, {(35, 37): False, (37, 38): False}
 
     with patch("litellm.completion", side_effect=_capture_completion), \
          patch("coverage_agent.engine.executor._run_once", side_effect=_fake_run_once):

@@ -146,7 +146,7 @@ def test_execution_runner_threads_python_executable(creds, tmp_path, monkeypatch
             target_branch_hit=True,
             targets_hit=1,
             targets_total=1,
-        )
+        ), {}
 
     from coverage_agent.engine.executor import ExecutionRunner
     with patch("coverage_agent.engine.executor._run_once", side_effect=_fake_run_once):

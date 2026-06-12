@@ -34,6 +34,8 @@ class PipelineState(TypedDict):
     draft_test: Optional[DraftTest]
     eval_result: Optional[ValidationResult]
     exec_result: Optional[ExecutionResult]
+    # Per-arc hit map from the verifying execution (multi-gap clusters only)
+    cluster_arc_hits: dict
 
     # ReAct trace steps (list of dicts — serialized later into AgentTrace)
     agent_trace: list
@@ -141,7 +143,8 @@ def _make_execution_runner_node(credentials: Credentials):
         from coverage_agent.engine.executor import ExecutionRunner
         cfg = state.get("config") or AgentConfig()
         cluster: list | None = state.get("cluster")
-        exec_result = ExecutionRunner(credentials).run(
+        runner = ExecutionRunner(credentials)
+        exec_result = runner.run(
             state["draft_test"],
             state["target_gap"],
             config=cfg,
@@ -156,7 +159,7 @@ def _make_execution_runner_node(credentials: Credentials):
             exec_result.targets_hit,
             exec_result.targets_total,
         )
-        updates: dict = {"exec_result": exec_result}
+        updates: dict = {"exec_result": exec_result, "cluster_arc_hits": runner.last_arc_hits}
 
         if exec_result.is_system_error:
             return updates
@@ -179,6 +182,7 @@ def _make_execution_runner_node(credentials: Credentials):
                     cluster=cluster,
                     primary_gap=gap,
                     exec_result=exec_result,
+                    arc_hits=runner.last_arc_hits,
                 )
                 hint = state["context"].branch_condition_hint if state.get("context") else None
                 hint_line = (
@@ -213,12 +217,13 @@ def _missed_arcs_from_cluster(
     cluster: list | None,
     primary_gap,
     exec_result,
+    arc_hits: dict | None = None,
 ) -> list:
     """Returns list of gaps in cluster whose arc was not hit by exec_result."""
     from coverage_agent.engine.executor import _cluster_results_from_exec
     if not cluster or len(cluster) <= 1:
         return []
-    per_gap = _cluster_results_from_exec(cluster, exec_result)
+    per_gap = _cluster_results_from_exec(cluster, exec_result, arc_hits)
     return [g for g, r in zip(cluster, per_gap) if not r.target_branch_hit]
 
 
@@ -449,7 +454,9 @@ def run_pipeline_cluster(
         return [primary_result], final_state
 
     # Build per-gap results using coverage data from the single execution.
-    per_exec = _cluster_results_from_exec(cluster, exec_result)
+    per_exec = _cluster_results_from_exec(
+        cluster, exec_result, final_state.get("cluster_arc_hits")
+    )
 
     gap_results: list[GapResult] = []
     for gap, gexec in zip(cluster, per_exec):

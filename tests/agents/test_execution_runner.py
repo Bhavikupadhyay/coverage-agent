@@ -113,12 +113,12 @@ def test_subprocess_path_passes_when_test_passes(creds, tmp_path, monkeypatch):
     cfg = AgentConfig(tests_dir=str(tmp_path / "tests_gen"), flaky_runs=1)
 
     with patch("coverage_agent.engine.executor._run_once") as mock_run:
-        mock_run.return_value = ExecutionResult(
+        mock_run.return_value = (ExecutionResult(
             execution_success=True,
             target_branch_hit=True,
             targets_hit=1,
             targets_total=1,
-        )
+        ), {})
         result = ExecutionRunner(creds).run(draft, gap, config=cfg)
 
     assert result.execution_success is True
@@ -136,8 +136,8 @@ def test_subprocess_path_flakiness_detected(creds, tmp_path, monkeypatch):
         call_count[0] += 1
         # Third run fails.
         if call_count[0] >= 3:
-            return ExecutionResult(execution_success=False, target_branch_hit=False, stderr_trace="flake")
-        return ExecutionResult(execution_success=True, target_branch_hit=True, targets_hit=1, targets_total=1)
+            return ExecutionResult(execution_success=False, target_branch_hit=False, stderr_trace="flake"), {}
+        return ExecutionResult(execution_success=True, target_branch_hit=True, targets_hit=1, targets_total=1), {}
 
     with patch("coverage_agent.engine.executor._run_once", side_effect=_fake_run_once):
         result = ExecutionRunner(creds).run(draft, gap, config=cfg)
@@ -155,7 +155,7 @@ def test_subprocess_first_run_fail_returns_immediately(creds, tmp_path, monkeypa
     call_count = [0]
     def _fake_run_once(*args, **kwargs):
         call_count[0] += 1
-        return ExecutionResult(execution_success=False, target_branch_hit=False, stderr_trace="fail")
+        return ExecutionResult(execution_success=False, target_branch_hit=False, stderr_trace="fail"), {}
 
     with patch("coverage_agent.engine.executor._run_once", side_effect=_fake_run_once):
         result = ExecutionRunner(creds).run(draft, gap, config=cfg)
@@ -244,7 +244,7 @@ def test_function_gap_no_body_lines_is_safe():
 # _cluster_results_from_exec — per-gap result derivation
 # ---------------------------------------------------------------------------
 
-from coverage_agent.engine.executor import _cluster_results_from_exec, _cluster_arc_store
+from coverage_agent.engine.executor import _cluster_results_from_exec
 from coverage_agent.contracts import ExecutionResult
 
 
@@ -286,18 +286,15 @@ def test_cluster_results_partial_acceptance():
         targets_hit=1,
         targets_total=2,
     )
-    # Inject arc-hit data directly into the store.
-    _cluster_arc_store[id(er)] = {
+    arc_hits = {
         (35, 37): True,
         (37, 38): False,
     }
 
-    results = _cluster_results_from_exec(cluster, er)
+    results = _cluster_results_from_exec(cluster, er, arc_hits)
     assert len(results) == 2
     assert results[0].target_branch_hit is True
     assert results[1].target_branch_hit is False
-    # Store entry is consumed.
-    assert id(er) not in _cluster_arc_store
 
 
 def test_cluster_results_none_exec_all_missed():
@@ -308,8 +305,8 @@ def test_cluster_results_none_exec_all_missed():
     assert all(not r.target_branch_hit for r in results)
 
 
-def test_cluster_results_fallback_when_no_arc_store():
-    """Without arc store data, only primary gap inherits the hit."""
+def test_cluster_results_fallback_without_arc_hits():
+    """Without an arc-hit map, only the primary gap inherits the hit."""
     g1 = _make_branch_gap(10, 12)
     g2 = _make_branch_gap(14, 16)
     cluster = [g1, g2]
@@ -320,7 +317,6 @@ def test_cluster_results_fallback_when_no_arc_store():
         targets_hit=1,
         targets_total=1,
     )
-    # No entry in _cluster_arc_store.
     results = _cluster_results_from_exec(cluster, er)
     assert results[0].target_branch_hit is True   # primary
     assert results[1].target_branch_hit is False  # sibling — conservative

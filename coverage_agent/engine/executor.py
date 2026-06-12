@@ -30,13 +30,6 @@ from coverage_agent.contracts import CoverageGap, DraftTest, ExecutionResult
 
 logger = logging.getLogger(__name__)
 
-# Per-run arc-hit data for cluster verification.  Keyed by id(ExecutionResult).
-# Entries are written by _run_once and consumed (and removed) by
-# _cluster_results_from_exec.  Private implementation detail — never part of
-# any external contract.
-_cluster_arc_store: dict[int, dict] = {}
-
-
 def _check_targets(
     gap: CoverageGap,
     cov_data,
@@ -85,15 +78,15 @@ def _check_targets(
 def _cluster_results_from_exec(
     cluster: list,
     exec_result: "ExecutionResult | None",
+    arc_hits: dict | None = None,
 ) -> list:
     """Returns one ExecutionResult per gap in cluster based on exec_result.
 
     When exec_result is None (pipeline was skipped or errored before execution),
-    every gap gets a not-hit result.  Otherwise each gap's arc-hit status is read
-    independently from exec_result's coverage data — but because the executor ran
-    only once we derive per-gap hit from the stored target arcs via the same
-    _check_targets helper, re-loading the coverage data from exec_result._cov_data
-    when available, or falling back to target_branch_hit for single-gap clusters.
+    every gap gets a not-hit result.  For multi-gap clusters, per-gap hit status
+    comes from arc_hits — the per-arc map produced by the same execution that
+    produced exec_result (ExecutionRunner.last_arc_hits). Without it, only the
+    primary gap conservatively inherits the hit.
     """
     if exec_result is None:
         return [
@@ -108,10 +101,7 @@ def _cluster_results_from_exec(
     if len(cluster) <= 1:
         return [exec_result]
 
-    # For multi-gap clusters we need to check each arc individually.
-    # _run_once stored per-arc hit data in _cluster_arc_store keyed by the
-    # result's id().  Consume and remove the entry to avoid unbounded growth.
-    arc_hits: dict = _cluster_arc_store.pop(id(exec_result), {})
+    arc_hits = arc_hits or {}
 
     results = []
     for gap in cluster:
@@ -173,12 +163,13 @@ def _run_once(
     timeout: int,
     python_executable: str = "",
     cluster: list | None = None,
-) -> ExecutionResult:
-    """Runs one pytest + coverage pass and returns an ExecutionResult.
+) -> "tuple[ExecutionResult, dict]":
+    """Runs one pytest + coverage pass.
 
-    When cluster has >1 gaps, checks every arc in the cluster and stores the
-    per-arc hit map in the result's _cluster_arc_hits attribute so callers can
-    build individual GapResults without re-reading coverage data.
+    Returns (result, arc_hits). For clusters of >1 gaps, arc_hits maps each
+    gap's (from_line, to_line) to whether this execution hit it, so callers
+    can build individual GapResults without re-reading coverage data. Empty
+    for single-gap runs and failures.
     """
     junit_xml = test_file.with_suffix(".xml")
     python = python_executable or sys.executable
@@ -211,7 +202,7 @@ def _run_once(
             target_branch_hit=False,
             stderr_trace=combined[-2000:],
             is_system_error=is_sys,
-        )
+        ), {}
 
     # pytest passed — check target coverage by gap kind.
     targets_hit = 0
@@ -263,16 +254,20 @@ def _run_once(
         targets_total=targets_total,
         stderr_trace=stderr,
     )
-    if arc_hits:
-        _cluster_arc_store[id(exec_result)] = arc_hits
-    return exec_result
+    return exec_result, arc_hits
 
 
 class ExecutionRunner:
-    """Runs a DraftTest and verifies it covers the target arc."""
+    """Runs a DraftTest and verifies it covers the target arc.
+
+    After run(), last_arc_hits holds the per-arc hit map of the verifying
+    execution for multi-gap clusters (empty otherwise) — instance state,
+    one runner per pipeline execution.
+    """
 
     def __init__(self, credentials: Credentials) -> None:
         self.creds = credentials
+        self.last_arc_hits: dict = {}
 
     def run(
         self,
@@ -284,6 +279,7 @@ class ExecutionRunner:
         sandbox=None,
         cluster: list | None = None,
     ) -> ExecutionResult:
+        self.last_arc_hits = {}
         if sandbox is not None:
             return self._run_sandbox(draft, gap, sandbox, baseline_coverage)
 
@@ -310,7 +306,7 @@ class ExecutionRunner:
             timeout = cfg.test_timeout
 
             try:
-                first = _run_once(tmp_test, gap, cov_data_file, cwd, timeout, python_executable, cluster=cluster)
+                first, first_arc_hits = _run_once(tmp_test, gap, cov_data_file, cwd, timeout, python_executable, cluster=cluster)
             except subprocess.TimeoutExpired:
                 return ExecutionResult(
                     execution_success=False,
@@ -328,7 +324,7 @@ class ExecutionRunner:
             results = [first]
             for _ in range(cfg.flaky_runs - 1):
                 try:
-                    r = _run_once(tmp_test, gap, cov_data_file, cwd, timeout, python_executable, cluster=cluster)
+                    r, _hits = _run_once(tmp_test, gap, cov_data_file, cwd, timeout, python_executable, cluster=cluster)
                     results.append(r)
                 except subprocess.TimeoutExpired:
                     results.append(ExecutionResult(
@@ -352,6 +348,7 @@ class ExecutionRunner:
                     flaky=True,
                 )
 
+            self.last_arc_hits = first_arc_hits
             return first
 
     def _run_sandbox(
