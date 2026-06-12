@@ -204,6 +204,11 @@ def _run_pipeline(
             continue
         gap_results.append(gap_result)
 
+        trace_steps = final_state.get("agent_trace") or []
+        if trace_steps:
+            from coverage_agent.contracts import AgentTrace
+            agent_traces.append(AgentTrace(gap_id=gap.gap_id, steps=trace_steps))
+
         if gap_result.accepted and gap_result.test_code:
             accepted_count += 1
             tests_dir = Path(repo_root) / cfg.tests_dir
@@ -239,6 +244,7 @@ def _run_pipeline(
         gaps_found=len(all_gaps),
         gaps_accepted=len(accepted),
         tests_accepted=len(accepted),
+        agent_traces=agent_traces,
         gap_results=gap_results,
         regression=regression,
     )
