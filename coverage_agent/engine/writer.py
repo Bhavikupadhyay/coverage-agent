@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from pathlib import Path
 
 import litellm
@@ -27,6 +28,28 @@ from coverage_agent.contracts import ContextPayload, CoverageGap, DraftTest
 logger = logging.getLogger(__name__)
 
 _SRC_LAYOUT_DIRS = frozenset({"src", "lib", "python", "source", "packages", "pkg"})
+
+# Free-tier providers return 429s mid-run (Gemini free tier: 5 requests/min).
+# For a CI tool the correct behavior is to wait out the window, not fail the
+# gap. Retries apply ONLY to RateLimitError — other failures raise immediately.
+_RATE_LIMIT_RETRIES = 4
+_RATE_LIMIT_BASE_SLEEP_S = 15.0
+
+
+def _completion(**kwargs):
+    """litellm.completion with exponential backoff on provider rate limits."""
+    for attempt in range(_RATE_LIMIT_RETRIES + 1):
+        try:
+            return litellm.completion(**kwargs)
+        except litellm.RateLimitError:
+            if attempt == _RATE_LIMIT_RETRIES:
+                raise
+            delay = _RATE_LIMIT_BASE_SLEEP_S * (2 ** attempt)
+            logger.warning(
+                "Rate limited by provider — sleeping %.0fs (retry %d/%d)",
+                delay, attempt + 1, _RATE_LIMIT_RETRIES,
+            )
+            time.sleep(delay)
 
 _SYSTEM_PROMPT = """\
 You are an expert Python test engineer. Your task is to write executable pytest code.
@@ -189,7 +212,7 @@ class TestWriter:
     ) -> str:
         user_prompt = _build_user_prompt(gap, context, critique, react_mode=False)
         try:
-            response = litellm.completion(
+            response = _completion(
                 messages=[
                     {"role": "system", "content": _SYSTEM_PROMPT},
                     {"role": "user", "content": user_prompt},
@@ -233,7 +256,7 @@ class TestWriter:
 
         for _ in range(cfg.max_tool_calls + 1):
             try:
-                response = litellm.completion(
+                response = _completion(
                     messages=messages,
                     tools=_tools.TOOLS_SPEC,
                     tool_choice="auto",
@@ -299,7 +322,7 @@ class TestWriter:
                     "content": "Budget reached. Return your best test code now as a ```python ... ``` block.",
                 })
                 try:
-                    final = litellm.completion(
+                    final = _completion(
                         messages=messages,
                         **self.creds.litellm_kwargs(),
                     )
