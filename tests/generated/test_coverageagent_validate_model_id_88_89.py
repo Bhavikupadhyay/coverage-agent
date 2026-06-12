@@ -2,11 +2,13 @@ import pytest
 from unittest.mock import patch
 from coverage_agent.credentials import validate_model_id
 
-@pytest.mark.parametrize("model", ["", None])
-def test_validate_model_id_empty_model(model):
-    assert validate_model_id(model) is None
+def test_validate_model_id():
+    # Test case for line 88 -> line 89 (condition: not model)
+    assert validate_model_id(None) is None
+    assert validate_model_id("") is None
 
-@pytest.mark.parametrize("model", ["valid_model", "another_model"])
-@patch("coverage_agent.credentials._REGISTRY", return_value=[])
-def test_validate_model_id_invalid_model(mock_registry, model):
-    assert validate_model_id(model) is not None
+    # Test case for line 90 -> line 93
+    with patch('coverage_agent.credentials._REGISTRY', [{"id": "model1"}, {"id": "model2"}]):
+        assert validate_model_id("model1") is None
+        assert validate_model_id("model2") is None
+        assert validate_model_id("model3") is not None

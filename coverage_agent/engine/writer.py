@@ -66,10 +66,15 @@ Rules:
   a Python package after `pip install -e .` — import the real top-level package name
   (the directory after the prefix, e.g. `requests`), never `import src` or `from src.…`
 
-When using tools:
-- Use read_source to inspect code you need but don't have
-- Use run_candidate to verify your test before returning the final answer
-- Return your final test as a plain Python code block (```python ... ```) in a text response
+When tools are available, this workflow is REQUIRED, not optional:
+1. Draft the test.
+2. Call run_candidate with the full draft. It actually executes the test and
+   reports pass/fail, stderr, and whether the target was hit.
+3. If it failed or missed the target, fix the draft and call run_candidate again.
+4. Only after run_candidate reports passed AND target hit, return the final code
+   in a ```python ... ``` block as a text response.
+Never return code you have not verified with run_candidate. Use read_source to
+inspect any code you need but don't have.
 """
 
 
@@ -181,9 +186,10 @@ def _build_user_prompt(
         )
 
     tools_hint = (
-        "\n\nYou have tools available. Use run_candidate to verify your test works before "
-        "submitting the final answer. When you're satisfied, return the final test code in "
-        "a ```python ... ``` block in a regular text response (not a tool call)."
+        "\n\nYou have tools available. You MUST verify your test with run_candidate "
+        "before submitting — do not return code that has not passed a run_candidate "
+        "call reporting the target was hit. After a verified run, return the final "
+        "test code in a ```python ... ``` block in a regular text response (not a tool call)."
         if react_mode else ""
     )
 
