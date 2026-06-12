@@ -1,4 +1,4 @@
-"""Small text helpers for report rendering."""
+"""Text helpers for report rendering."""
 from __future__ import annotations
 
 
