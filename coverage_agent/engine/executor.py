@@ -113,13 +113,15 @@ def _run_once(
     cov_data_file: Path,
     cwd: str,
     timeout: int,
+    python_executable: str = "",
 ) -> ExecutionResult:
     """Runs one pytest + coverage pass and returns an ExecutionResult."""
     junit_xml = test_file.with_suffix(".xml")
+    python = python_executable or sys.executable
 
     result = subprocess.run(
         [
-            sys.executable, "-m", "coverage", "run",
+            python, "-m", "coverage", "run",
             "--branch",
             "--append",
             f"--data-file={cov_data_file}",
@@ -204,6 +206,8 @@ class ExecutionRunner:
         tests_dir = Path(cfg.tests_dir)
         tests_dir.mkdir(parents=True, exist_ok=True)
 
+        python_executable = cfg.python_executable or sys.executable
+
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_test = Path(tmpdir) / "test_candidate.py"
             tmp_test.write_text(draft.test_code, encoding="utf-8")
@@ -212,7 +216,7 @@ class ExecutionRunner:
             timeout = cfg.test_timeout
 
             try:
-                first = _run_once(tmp_test, gap, cov_data_file, cwd, timeout)
+                first = _run_once(tmp_test, gap, cov_data_file, cwd, timeout, python_executable)
             except subprocess.TimeoutExpired:
                 return ExecutionResult(
                     execution_success=False,
@@ -230,7 +234,7 @@ class ExecutionRunner:
             results = [first]
             for _ in range(cfg.flaky_runs - 1):
                 try:
-                    r = _run_once(tmp_test, gap, cov_data_file, cwd, timeout)
+                    r = _run_once(tmp_test, gap, cov_data_file, cwd, timeout, python_executable)
                     results.append(r)
                 except subprocess.TimeoutExpired:
                     results.append(ExecutionResult(

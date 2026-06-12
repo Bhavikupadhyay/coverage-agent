@@ -48,6 +48,10 @@ class AgentConfig(BaseModel):
     test_timeout: int = 60
     budget_usd: float = 1.00
     dashboard_url: str = ""
+    # The Python interpreter used for pytest/coverage subprocesses.
+    # Empty string means "use sys.executable at call time" — set explicitly by
+    # ci-run to the job's python when it differs from the tool's own interpreter.
+    python_executable: str = ""
 
     model_config = {"extra": "ignore"}
 

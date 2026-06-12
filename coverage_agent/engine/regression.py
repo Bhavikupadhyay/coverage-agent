@@ -60,9 +60,17 @@ def _run_test_command(
     junit_xml: Path,
     cwd: str,
     timeout: int = 300,
+    python_executable: str = "",
 ) -> tuple[int, int]:
     """Runs test_command and returns (passed, failed) from junit output."""
-    cmd = test_command.split() + [f"--junit-xml={junit_xml}", "-q"]
+    raw_cmd = test_command.split() + [f"--junit-xml={junit_xml}", "-q"]
+    # If the command starts with "pytest", prepend the configured python so
+    # we run the job's interpreter (not the tool's own venv python).
+    python = python_executable or sys.executable
+    if raw_cmd and raw_cmd[0] == "pytest":
+        cmd = [python, "-m"] + raw_cmd
+    else:
+        cmd = raw_cmd
     try:
         subprocess.run(
             cmd,
@@ -146,6 +154,7 @@ class RegressionGuard:
                 cfg.test_command,
                 junit_xml,
                 cwd=repo_root,
+                python_executable=cfg.python_executable,
             )
 
         new_failures = max(0, post_failed - baseline_failed)

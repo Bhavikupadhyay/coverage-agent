@@ -22,3 +22,6 @@ jobs:
 
       - name: Run acceptance harness (mock-LLM)
         run: uv run python benchmarks/run_acceptance.py --mock-llm
+
+      - name: Mock ci-run end-to-end reporting check
+        run: uv run pytest tests/test_ci_run_e2e.py -q

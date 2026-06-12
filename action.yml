@@ -1,0 +1,109 @@
+# coverage-agent GitHub Action — composite
+#
+# Required permissions:
+#   pull-requests: write   (always — to upsert the PR comment)
+#   contents: write        (only for commit-mode: commit or pr)
+#
+# Note: dashboard-url is intentionally omitted. The read-only dashboard is
+# a post-v1 feature and does not exist yet; the input will be added when the
+# dashboard endpoint is available.
+
+name: coverage-agent
+description: Generate pytest tests for uncovered branches and deliver them as a PR comment, commit, or stacked PR.
+
+inputs:
+  llm-api-key:
+    description: >
+      API key for the configured LLM provider (passed to the provider's SDK via
+      the env var named in the model registry). Required.
+    required: true
+
+  model:
+    description: >
+      LiteLLM model ID to use (e.g. gemini/gemini-2.5-flash, openai/gpt-4o).
+      Defaults to the registry default when omitted.
+    required: false
+    default: ""
+
+  coverage-file:
+    description: >
+      Path to an existing coverage file (.coverage, coverage.json, or coverage.xml).
+      When omitted, coverage-agent runs `coverage run --branch -m pytest` first.
+    required: false
+    default: ""
+
+  scope:
+    description: "Gap scope: diff (default, PR changes only) or full (whole repo)."
+    required: false
+    default: "diff"
+
+  commit-mode:
+    description: >
+      Delivery mode: comment (default — unified diff in the PR comment, no git writes),
+      commit (git-commit generated tests to the PR branch),
+      or pr (open a stacked PR with the tests).
+    required: false
+    default: "comment"
+
+  config-path:
+    description: "Path to .coverage-agent.yml (optional; discovered automatically when omitted)."
+    required: false
+    default: ""
+
+  version:
+    description: >
+      Package version to use. "local" (default) runs from the action checkout via
+      `uv run --project`. Any other value runs `uvx --from coverage-agent==<version>`.
+      Use "local" until the package is published to PyPI.
+    required: false
+    default: "local"
+
+  github-token:
+    description: >
+      GitHub token for PR comment upserts and (in commit/pr mode) git pushes.
+      Defaults to the workflow's built-in github.token.
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  tests-added:
+    description: "Number of tests accepted and delivered."
+    value: ${{ steps.ci-run.outputs.tests-added }}
+
+  gaps-found:
+    description: "Total coverage gaps found."
+    value: ${{ steps.ci-run.outputs.gaps-found }}
+
+  report-path:
+    description: "Path to the RunReport JSON file written by the run."
+    value: ${{ steps.ci-run.outputs.report-path }}
+
+runs:
+  using: composite
+  steps:
+    - uses: astral-sh/setup-uv@v5
+      with:
+        enable-cache: true
+
+    - name: Run coverage-agent ci-run
+      id: ci-run
+      shell: bash
+      env:
+        LLM_API_KEY: ${{ inputs.llm-api-key }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: |
+        if [ "${{ inputs.version }}" = "local" ]; then
+          uv run --project "$GITHUB_ACTION_PATH" coverage-agent ci-run \
+            ${{ inputs.coverage-file != '' && format('--coverage-file {0}', inputs.coverage-file) || '' }} \
+            ${{ inputs.scope != '' && format('--scope {0}', inputs.scope) || '' }} \
+            ${{ inputs.commit-mode != '' && format('--commit-mode {0}', inputs.commit-mode) || '' }} \
+            ${{ inputs.model != '' && format('--model {0}', inputs.model) || '' }} \
+            ${{ inputs.config-path != '' && format('--config {0}', inputs.config-path) || '' }}
+        else
+          uvx --from "coverage-agent==${{ inputs.version }}" coverage-agent ci-run \
+            ${{ inputs.coverage-file != '' && format('--coverage-file {0}', inputs.coverage-file) || '' }} \
+            ${{ inputs.scope != '' && format('--scope {0}', inputs.scope) || '' }} \
+            ${{ inputs.commit-mode != '' && format('--commit-mode {0}', inputs.commit-mode) || '' }} \
+            ${{ inputs.model != '' && format('--model {0}', inputs.model) || '' }} \
+            ${{ inputs.config-path != '' && format('--config {0}', inputs.config-path) || '' }}
+        fi

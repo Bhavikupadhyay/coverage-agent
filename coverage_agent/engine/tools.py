@@ -179,6 +179,7 @@ def run_candidate(
     gap_surrounding_lines: list[int] | None = None,
     target_file: str = "",
     repo_root: str = ".",
+    python_executable: str = "",
 ) -> dict[str, Any]:
     """Execute a draft test in the caller's environment.
 
@@ -198,6 +199,8 @@ def run_candidate(
     from coverage_agent.engine.executor import _check_targets
     from coverage_agent.contracts import BranchGap, CoverageGap
 
+    python = python_executable or sys.executable
+
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_test = Path(tmpdir) / "test_candidate.py"
         tmp_test.write_text(test_code, encoding="utf-8")
@@ -207,7 +210,7 @@ def run_candidate(
         # Run pytest (no coverage on the inner run to keep it fast).
         pytest_result = subprocess.run(
             [
-                sys.executable, "-m", "pytest",
+                python, "-m", "pytest",
                 str(tmp_test),
                 "--tb=short", "-q",
                 f"--junit-xml={junit_xml}",
@@ -226,7 +229,7 @@ def run_candidate(
             # Re-run with coverage to check target hit by gap kind.
             cov_result = subprocess.run(
                 [
-                    sys.executable, "-m", "coverage", "run",
+                    python, "-m", "coverage", "run",
                     "--branch", f"--data-file={cov_file}",
                     "-m", "pytest", str(tmp_test), "-q", "--tb=no",
                 ],
@@ -264,7 +267,7 @@ def run_candidate(
 # Dispatcher — called from the writer's ReAct loop
 # ---------------------------------------------------------------------------
 
-def dispatch(tool_name: str, tool_input: dict, repo_root: str = ".", **gap_kwargs) -> str:
+def dispatch(tool_name: str, tool_input: dict, repo_root: str = ".", python_executable: str = "", **gap_kwargs) -> str:
     """Routes a tool call from the LLM to its implementation.
 
     Returns the result as a string (tool observation for the next LLM turn).
@@ -285,6 +288,7 @@ def dispatch(tool_name: str, tool_input: dict, repo_root: str = ".", **gap_kwarg
             result = run_candidate(
                 test_code=tool_input["test_code"],
                 repo_root=repo_root,
+                python_executable=python_executable,
                 **gap_kwargs,
             )
             return json.dumps(result)
