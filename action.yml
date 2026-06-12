@@ -88,22 +88,26 @@ runs:
     - name: Run coverage-agent ci-run
       id: ci-run
       shell: bash
+      # Inputs reach the script only through env vars — never interpolated
+      # into the script body — so input values can't inject shell syntax.
       env:
         LLM_API_KEY: ${{ inputs.llm-api-key }}
         GITHUB_TOKEN: ${{ inputs.github-token }}
+        CA_VERSION: ${{ inputs.version }}
+        CA_COVERAGE_FILE: ${{ inputs.coverage-file }}
+        CA_SCOPE: ${{ inputs.scope }}
+        CA_COMMIT_MODE: ${{ inputs.commit-mode }}
+        CA_MODEL: ${{ inputs.model }}
+        CA_CONFIG_PATH: ${{ inputs.config-path }}
       run: |
-        if [ "${{ inputs.version }}" = "local" ]; then
-          uv run --project "$GITHUB_ACTION_PATH" coverage-agent ci-run \
-            ${{ inputs.coverage-file != '' && format('--coverage-file {0}', inputs.coverage-file) || '' }} \
-            ${{ inputs.scope != '' && format('--scope {0}', inputs.scope) || '' }} \
-            ${{ inputs.commit-mode != '' && format('--commit-mode {0}', inputs.commit-mode) || '' }} \
-            ${{ inputs.model != '' && format('--model {0}', inputs.model) || '' }} \
-            ${{ inputs.config-path != '' && format('--config {0}', inputs.config-path) || '' }}
+        args=()
+        [ -n "$CA_COVERAGE_FILE" ] && args+=(--coverage-file "$CA_COVERAGE_FILE")
+        [ -n "$CA_SCOPE" ]         && args+=(--scope "$CA_SCOPE")
+        [ -n "$CA_COMMIT_MODE" ]   && args+=(--commit-mode "$CA_COMMIT_MODE")
+        [ -n "$CA_MODEL" ]         && args+=(--model "$CA_MODEL")
+        [ -n "$CA_CONFIG_PATH" ]   && args+=(--config "$CA_CONFIG_PATH")
+        if [ "$CA_VERSION" = "local" ]; then
+          uv run --project "$GITHUB_ACTION_PATH" coverage-agent ci-run "${args[@]}"
         else
-          uvx --from "coverage-agent==${{ inputs.version }}" coverage-agent ci-run \
-            ${{ inputs.coverage-file != '' && format('--coverage-file {0}', inputs.coverage-file) || '' }} \
-            ${{ inputs.scope != '' && format('--scope {0}', inputs.scope) || '' }} \
-            ${{ inputs.commit-mode != '' && format('--commit-mode {0}', inputs.commit-mode) || '' }} \
-            ${{ inputs.model != '' && format('--model {0}', inputs.model) || '' }} \
-            ${{ inputs.config-path != '' && format('--config {0}', inputs.config-path) || '' }}
+          uvx --from "coverage-agent==$CA_VERSION" coverage-agent ci-run "${args[@]}"
         fi

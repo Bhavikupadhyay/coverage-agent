@@ -54,8 +54,6 @@ def run(
     branch or commit you want to target before running; use --scope diff
     with --base to target only the changes since a ref.
     """
-    import os
-
     if verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
