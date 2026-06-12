@@ -216,6 +216,8 @@ class TestWriter:
         gap_kwargs = {
             "gap_from_line": gap.branch.from_line,
             "gap_to_line": gap.branch.to_line,
+            "gap_kind": gap.kind,
+            "gap_surrounding_lines": gap.surrounding_lines,
             "target_file": gap.file_path,
             "repo_root": repo_root,
         }

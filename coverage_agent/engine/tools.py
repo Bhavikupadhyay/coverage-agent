@@ -6,6 +6,9 @@ outer Executor runs its deterministic 3-run flakiness gate.
 
 run_candidate is the INNER loop execution (agent self-check).
 ExecutionRunner is the OUTER deterministic gate (3 runs, arcs verified).
+
+Both use _check_targets from executor.py so the acceptance rule is defined
+exactly once and is identical in both places.
 """
 from __future__ import annotations
 
@@ -172,13 +175,17 @@ def run_candidate(
     test_code: str,
     gap_from_line: int = 0,
     gap_to_line: int = 0,
+    gap_kind: str = "branch",
+    gap_surrounding_lines: list[int] | None = None,
     target_file: str = "",
     repo_root: str = ".",
 ) -> dict[str, Any]:
     """Execute a draft test in the caller's environment.
 
     Writes the test to a temp file, runs pytest, and if pytest passes reads
-    the coverage arcs to check whether the target branch was hit.
+    the coverage data to check whether the target was hit.  Target-hit logic
+    is gap-kind-aware via _check_targets (imported from executor) so the rule
+    is identical to the outer Executor gate.
 
     Returns:
         {
@@ -188,6 +195,9 @@ def run_candidate(
             "targets_total": int,
         }
     """
+    from coverage_agent.engine.executor import _check_targets
+    from coverage_agent.contracts import BranchGap, CoverageGap
+
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_test = Path(tmpdir) / "test_candidate.py"
         tmp_test.write_text(test_code, encoding="utf-8")
@@ -213,7 +223,7 @@ def run_candidate(
         targets_total = 1 if (gap_from_line and gap_to_line) else 0
 
         if passed and target_file and gap_from_line and gap_to_line:
-            # Re-run with coverage to check arc hit.
+            # Re-run with coverage to check target hit by gap kind.
             cov_result = subprocess.run(
                 [
                     sys.executable, "-m", "coverage", "run",
@@ -229,11 +239,18 @@ def run_candidate(
                     cov.load()
                     data = cov.get_data()
                     abs_target = str(Path(repo_root) / target_file)
-                    arcs = data.arcs(abs_target) or []
-                    if (gap_from_line, gap_to_line) in arcs:
-                        targets_hit = 1
+                    gap = CoverageGap(
+                        file_path=target_file,
+                        target_symbol="",
+                        branch=BranchGap(from_line=gap_from_line, to_line=gap_to_line),
+                        surrounding_lines=gap_surrounding_lines or [],
+                        kind=gap_kind,  # type: ignore[arg-type]
+                        origin="diff",
+                        gap_id=f"{target_file}:{gap_from_line}->{gap_to_line}",
+                    )
+                    targets_hit, targets_total = _check_targets(gap, data, abs_target)
                 except Exception as exc:
-                    logger.debug("run_candidate arc check failed: %s", exc)
+                    logger.debug("run_candidate coverage check failed: %s", exc)
 
         return {
             "passed": passed,

@@ -162,3 +162,79 @@ def test_subprocess_first_run_fail_returns_immediately(creds, tmp_path, monkeypa
 
     assert call_count[0] == 1
     assert result.execution_success is False
+
+
+# ---------------------------------------------------------------------------
+# _check_targets — kind-aware target verification
+# ---------------------------------------------------------------------------
+
+from coverage_agent.engine.executor import _check_targets
+
+
+class _FakeCovData:
+    """Minimal stand-in for coverage.CoverageData: arcs() + lines()."""
+
+    def __init__(self, arcs=None, lines=None):
+        self._arcs = arcs or []
+        self._lines = lines or []
+
+    def arcs(self, _path):
+        return self._arcs
+
+    def lines(self, _path):
+        return self._lines
+
+
+def _make_function_gap(def_line: int = 5, body: list[int] | None = None) -> CoverageGap:
+    body = body if body is not None else [6, 7, 8, 9]
+    return CoverageGap(
+        file_path="pkg/scoring.py",
+        target_symbol="percentage",
+        branch=BranchGap(from_line=def_line, to_line=body[-1] if body else def_line),
+        surrounding_lines=[def_line] + body,
+        kind="function",
+        origin="diff",
+        gap_id=f"pkg/scoring.py:{def_line}->{body[-1] if body else def_line}",
+    )
+
+
+def test_branch_gap_arc_present_is_hit():
+    gap = _make_gap(10, 12)
+    data = _FakeCovData(arcs=[(10, 12), (1, 2)])
+    assert _check_targets(gap, data, "pkg/auth.py") == (1, 1)
+
+
+def test_branch_gap_arc_absent_is_miss():
+    gap = _make_gap(10, 12)
+    data = _FakeCovData(arcs=[(10, 11), (1, 2)])
+    assert _check_targets(gap, data, "pkg/auth.py") == (0, 1)
+
+
+def test_function_gap_body_executed_is_hit():
+    gap = _make_function_gap(def_line=5, body=[6, 7, 8, 9])
+    data = _FakeCovData(lines=[5, 6, 7, 8, 9])
+    hit, total = _check_targets(gap, data, "pkg/scoring.py")
+    assert (hit, total) == (4, 4)
+    assert hit >= 1 and hit / total >= 0.5  # accepted under the engine rule
+
+
+def test_function_gap_import_only_is_rejected():
+    # Import executes only the def line; no body line runs.
+    gap = _make_function_gap(def_line=5, body=[6, 7, 8, 9])
+    data = _FakeCovData(lines=[5])
+    hit, total = _check_targets(gap, data, "pkg/scoring.py")
+    assert (hit, total) == (0, 4)
+
+
+def test_function_gap_partial_below_half_is_rejected():
+    gap = _make_function_gap(def_line=5, body=[6, 7, 8, 9])
+    data = _FakeCovData(lines=[5, 6])
+    hit, total = _check_targets(gap, data, "pkg/scoring.py")
+    assert (hit, total) == (1, 4)
+    assert not (hit >= 1 and hit / total >= 0.5)
+
+
+def test_function_gap_no_body_lines_is_safe():
+    gap = _make_function_gap(def_line=5, body=[])
+    data = _FakeCovData(lines=[5])
+    assert _check_targets(gap, data, "pkg/scoring.py") == (0, 0)

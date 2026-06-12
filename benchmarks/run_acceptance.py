@@ -53,6 +53,12 @@ EXPECTED_DIFF_GAPS = 3
 # Branch gaps in stats.py are genuine and the canned tests hit all 9 arcs.
 REQUIRED_ACCEPTED_FULL = 2
 
+# Minimum tests that must be accepted for the diff-scope run. Function gaps
+# are verified by executed body lines (see executor._check_targets); the
+# canned scoring tests genuinely call all three functions. This assertion is
+# the regression guard against diff scope silently accepting nothing again.
+REQUIRED_ACCEPTED_DIFF = 2
+
 # ---------------------------------------------------------------------------
 # Canned test code
 # ---------------------------------------------------------------------------
@@ -402,6 +408,10 @@ def main() -> None:
         if diff_found != EXPECTED_DIFF_GAPS:
             failures.append(
                 f"diff scope: expected gaps_found={EXPECTED_DIFF_GAPS}, got {diff_found}"
+            )
+        if diff_accepted < REQUIRED_ACCEPTED_DIFF:
+            failures.append(
+                f"diff scope: expected tests_accepted>={REQUIRED_ACCEPTED_DIFF}, got {diff_accepted}"
             )
 
         # ---- Full scope (on main) ----

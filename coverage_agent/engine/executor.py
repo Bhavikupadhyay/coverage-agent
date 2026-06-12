@@ -10,6 +10,10 @@ results → flaky=True (not accepted).
 
 Arc verification uses coverage.Coverage(data_file=...) — never regex on stdout.
 junit XML + exit code is the pass/fail signal.
+
+Target-hit logic is gap-kind-aware (see _check_targets). Both the outer
+Executor and the ReAct agent's inner run_candidate use this same helper so
+the acceptance rule is defined exactly once.
 """
 from __future__ import annotations
 
@@ -25,6 +29,51 @@ from coverage_agent.credentials import Credentials
 from coverage_agent.contracts import CoverageGap, DraftTest, ExecutionResult
 
 logger = logging.getLogger(__name__)
+
+def _check_targets(
+    gap: CoverageGap,
+    cov_data,
+    abs_target: str,
+) -> tuple[int, int]:
+    """Returns (targets_hit, targets_total) based on gap.kind.
+
+    kind="branch":
+        Exact arc membership — unchanged from the original logic.
+        targets_total=1; targets_hit=1 iff the arc is executed.
+
+    kind="function" or kind="line":
+        Verified by executed lines, not arcs.  Import alone executes the
+        'def' line (gap.branch.from_line) without running any body code, so
+        the def line is excluded from the count — only body lines matter.
+        targets_total = len(body lines); targets_hit = body lines executed.
+        Accept when targets_hit >= 1 AND targets_hit/targets_total >= 0.5.
+        Rationale: a real test that calls the function executes the main path
+        (well over half the body); an import-only or trivially-passing test
+        doesn't.  Avoids false accepts while not penalising short functions.
+
+    If gap.surrounding_lines is empty for a function/line gap, treats as not
+    hit (targets_total=0) and logs a debug message — never divides by zero.
+    """
+    if gap.kind == "branch":
+        arcs = set(cov_data.arcs(abs_target) or [])
+        hit = 1 if (gap.branch.from_line, gap.branch.to_line) in arcs else 0
+        return hit, 1
+
+    # kind == "function" or kind == "line"
+    def_line = gap.branch.from_line
+    body_lines = [ln for ln in gap.surrounding_lines if ln != def_line]
+    if not body_lines:
+        logger.debug(
+            "gap %s has no body lines in surrounding_lines — treating as not hit",
+            gap.gap_id,
+        )
+        return 0, 0
+
+    executed = set(cov_data.lines(abs_target) or [])
+    hit = sum(1 for ln in body_lines if ln in executed)
+    total = len(body_lines)
+    return hit, total
+
 
 _SYSTEM_ERROR_PATTERNS: tuple[str, ...] = (
     "Can't append to data files in parallel mode",
@@ -98,7 +147,7 @@ def _run_once(
             is_system_error=is_sys,
         )
 
-    # pytest passed — check arc.
+    # pytest passed — check target coverage by gap kind.
     targets_hit = 0
     targets_total = 1
     try:
@@ -107,15 +156,18 @@ def _run_once(
         cov.load()
         data = cov.get_data()
         abs_target = str(Path(cwd) / gap.file_path)
-        arcs = set(data.arcs(abs_target) or [])
-        if (gap.branch.from_line, gap.branch.to_line) in arcs:
-            targets_hit = 1
+        targets_hit, targets_total = _check_targets(gap, data, abs_target)
     except Exception as exc:
-        logger.debug("Arc check failed for %s: %s", gap.gap_id, exc)
+        logger.debug("Coverage check failed for %s: %s", gap.gap_id, exc)
 
+    accepted = (
+        targets_hit >= 1
+        and targets_total > 0
+        and targets_hit / targets_total >= 0.5
+    )
     return ExecutionResult(
         execution_success=True,
-        target_branch_hit=targets_hit > 0,
+        target_branch_hit=accepted,
         targets_hit=targets_hit,
         targets_total=targets_total,
         stderr_trace=stderr,
