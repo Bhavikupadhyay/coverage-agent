@@ -1,0 +1,36 @@
+name: coverage-agent
+
+on:
+  pull_request:
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  coverage-agent:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so the diff base (merge-base with the PR base branch)
+          # is resolvable.
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # The job environment the generated tests execute in: project deps
+      # installed, venv python first on PATH.
+      - name: Install project
+        run: |
+          uv sync
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+
+      - uses: ./
+        with:
+          llm-api-key: ${{ secrets.LLM_API_KEY }}
+          model: groq/llama-3.3-70b-versatile
+          scope: diff
+          commit-mode: comment
