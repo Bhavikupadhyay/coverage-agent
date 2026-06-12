@@ -50,30 +50,23 @@ EXPECTED_FULL_GAPS = 9
 EXPECTED_DIFF_GAPS = 3
 
 # Minimum tests that must be accepted for the full-scope run.
-# Branch gaps in stats.py are genuine and the canned tests hit all 9 arcs.
-REQUIRED_ACCEPTED_FULL = 2
+# Clustered canned tests cover all 9 arcs (4 clusters, 9 individual GapResults).
+REQUIRED_ACCEPTED_FULL = 9
 
-# Minimum tests that must be accepted for the diff-scope run. Function gaps
-# are verified by executed body lines (see executor._check_targets); the
-# canned scoring tests genuinely call all three functions. This assertion is
-# the regression guard against diff scope silently accepting nothing again.
-REQUIRED_ACCEPTED_DIFF = 2
+# Minimum tests that must be accepted for the diff-scope run.
+# 3 single-function clusters → 3 accepted GapResults.
+REQUIRED_ACCEPTED_DIFF = 3
 
 # ---------------------------------------------------------------------------
-# Canned test code
+# Canned test code — one per function cluster
 # ---------------------------------------------------------------------------
 
-# These tests genuinely cover the 9 missing branch arcs in stats.py.
-# Verification: cd benchmarks/fixture_repo && coverage run --branch --data-file=.c
-#   -m pytest /tmp/test_canned.py -q && python -c "
-#   import coverage as c; cov=c.Coverage(data_file='.c'); cov.load(); data=cov.get_data()
-#   arcs=set(data.arcs('<abs_path>/mathlib/stats.py') or [])
-#   for a in [(11,12),(13,14),(24,25),(35,37),(37,38),(37,40),(49,51),(53,54),(53,55)]:
-#       print(a, 'HIT' if a in arcs else 'MISS')"
-# All 9 print HIT.
-_CANNED_STATS_TESTS = '''\
-"""Generated tests that cover the uncovered branches in mathlib/stats.py."""
-from mathlib.stats import clamp, safe_divide, letter_grade, normalize
+# clamp cluster: arcs (11,12) and (13,14)
+# Verified: test_clamp_below_lo hits arc (11,12) [value<lo→return lo];
+#           test_clamp_above_hi hits arc (13,14) [value>hi→return hi].
+_CANNED_CLAMP_TESTS = '''\
+"""Generated tests covering uncovered branches of clamp."""
+from mathlib.stats import clamp
 
 
 def test_clamp_below_lo():
@@ -82,10 +75,25 @@ def test_clamp_below_lo():
 
 def test_clamp_above_hi():
     assert clamp(15, 0, 10) == 10
+'''
+
+# safe_divide cluster: arc (24,25)
+# Verified: test_safe_divide_zero hits arc (24,25) [denominator==0→return 0.0].
+_CANNED_SAFE_DIVIDE_TESTS = '''\
+"""Generated tests covering uncovered branches of safe_divide."""
+from mathlib.stats import safe_divide
 
 
 def test_safe_divide_zero():
     assert safe_divide(5, 0) == 0.0
+'''
+
+# letter_grade cluster: arcs (35,37), (37,38), (37,40)
+# Arc (35,37): score<90 → falls to elif; (37,38): score>=80 → "B"; (37,40): score<80 → "C".
+# Verified: test_letter_grade_b hits (35,37)+(37,38); test_letter_grade_c hits (35,37)+(37,40).
+_CANNED_LETTER_GRADE_TESTS = '''\
+"""Generated tests covering uncovered branches of letter_grade."""
+from mathlib.stats import letter_grade
 
 
 def test_letter_grade_b():
@@ -94,6 +102,14 @@ def test_letter_grade_b():
 
 def test_letter_grade_c():
     assert letter_grade(70) == "C"
+'''
+
+# normalize cluster: arcs (49,51), (53,54), (53,55)
+# Arc (49,51): values non-empty → body; (53,54): lo==hi → uniform list; (53,55): lo!=hi → scaled.
+# Verified: test_normalize_uniform hits (49,51)+(53,54); test_normalize_range hits (49,51)+(53,55).
+_CANNED_NORMALIZE_TESTS = '''\
+"""Generated tests covering uncovered branches of normalize."""
+from mathlib.stats import normalize
 
 
 def test_normalize_uniform():
@@ -106,9 +122,8 @@ def test_normalize_range():
     assert result == [0.0, 0.5, 1.0]
 '''
 
-# Canned test for new-file scoring gaps (function kind — tests pass pytest,
-# but function-span arc check won't flip target_branch_hit in the executor;
-# these are included so the writer produces valid, runnable code).
+# scoring cluster: 3 function gaps (diff scope, one cluster per function)
+# Each scoring function gets its own cluster of 1 gap.
 _CANNED_SCORING_TESTS = '''\
 """Generated tests for mathlib/scoring.py (new file, diff scope)."""
 from mathlib.scoring import percentage, pass_fail, weighted_average
@@ -126,6 +141,27 @@ def test_weighted_average_basic():
     result = weighted_average([80.0, 90.0], [1.0, 1.0])
     assert result == 85.0
 '''
+
+# Symbol-to-canned-test routing map for full-scope stats.py clusters.
+_STATS_SYMBOL_TO_CANNED = {
+    "clamp": _CANNED_CLAMP_TESTS,
+    "safe_divide": _CANNED_SAFE_DIVIDE_TESTS,
+    "letter_grade": _CANNED_LETTER_GRADE_TESTS,
+    "normalize": _CANNED_NORMALIZE_TESTS,
+}
+
+
+def _canned_for_cluster(cluster) -> str:
+    """Returns the appropriate canned test code for a cluster.
+
+    Routes by the primary gap's target_symbol for stats.py clusters, and falls
+    back to the scoring canned tests for new-file (diff) clusters.
+    """
+    primary = cluster[0]
+    if "scoring" in primary.file_path:
+        return _CANNED_SCORING_TESTS
+    symbol = primary.target_symbol
+    return _STATS_SYMBOL_TO_CANNED.get(symbol, _CANNED_NORMALIZE_TESTS)
 
 
 def _make_mock_completion(test_code: str):
@@ -242,9 +278,9 @@ def _invoke_engine(
     from coverage_agent.config import AgentConfig
     from coverage_agent.credentials import Credentials
     from coverage_agent.gaps.coverage_data import load_coverage_file, parse_coverage
-    from coverage_agent.gaps.select import select_gaps
+    from coverage_agent.gaps.select import select_gaps, cluster_gaps
     from coverage_agent.gaps.diff import compute_diff_gaps
-    from coverage_agent.engine.graph import run_pipeline
+    from coverage_agent.engine.graph import run_pipeline_cluster
 
     cfg = AgentConfig(
         scope=scope,
@@ -277,15 +313,10 @@ def _invoke_engine(
 
     gaps_found = len(all_gaps)
     candidate_gaps = select_gaps(all_gaps, max_gaps=cfg.max_gaps, exclude=[])
+    clusters = cluster_gaps(candidate_gaps)
 
-    if not candidate_gaps:
+    if not clusters:
         return gaps_found, 0
-
-    # Determine which canned test to use per gap.
-    def _canned_for_gap(gap) -> str:
-        if "scoring" in gap.file_path:
-            return _CANNED_SCORING_TESTS
-        return _CANNED_STATS_TESTS
 
     accepted_count = 0
     old_cwd = os.getcwd()
@@ -294,27 +325,29 @@ def _invoke_engine(
         os.chdir(str(tmp_dir))
         os.environ["PYTHONPATH"] = str(tmp_dir)
 
-        for gap in candidate_gaps:
-            canned = _canned_for_gap(gap)
+        for cl in clusters:
+            canned = _canned_for_cluster(cl)
             mock_fn = _make_mock_completion(canned) if mock_llm else None
 
             ctx_mgr = patch("litellm.completion", side_effect=mock_fn) if mock_llm else _noop_ctx()
 
             with ctx_mgr:
                 try:
-                    gap_result, _ = run_pipeline(
-                        gap=gap,
+                    cluster_results, _ = run_pipeline_cluster(
+                        cluster=cl,
                         credentials=creds,
                         config=cfg,
                         baseline_coverage=coverage_data,
                         repo_path=repo_root,
                     )
                 except Exception as exc:
-                    print(f"  [warning] gap {gap.gap_id} pipeline error: {exc}", file=sys.stderr)
+                    print(
+                        f"  [warning] cluster {cl[0].gap_id} pipeline error: {exc}",
+                        file=sys.stderr,
+                    )
                     continue
 
-            if gap_result.accepted:
-                accepted_count += 1
+            accepted_count += sum(1 for r in cluster_results if r.accepted)
 
     finally:
         os.chdir(old_cwd)

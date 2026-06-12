@@ -23,6 +23,9 @@ class PipelineState(TypedDict):
     # Inputs — set before each gap
     repo_path: str
     target_gap: CoverageGap
+    # Cluster of sibling gaps sharing the same (file_path, target_symbol).
+    # None or a single-element list → single-gap behaviour (unchanged).
+    cluster: Optional[list]
     baseline_coverage: dict
     config: AgentConfig
 
@@ -106,6 +109,7 @@ def _make_test_writer_node(credentials: Credentials):
             critique=state["last_critique"],
             config=cfg,
             trace=trace,
+            cluster=state.get("cluster"),
         )
         logger.info("test_writer: gap=%s mocks=%s", state["target_gap"].gap_id, draft.mocks_used)
         return {"draft_test": draft, "agent_trace": trace}
@@ -136,11 +140,13 @@ def _make_execution_runner_node(credentials: Credentials):
     def _execution_runner_node(state: PipelineState) -> dict:
         from coverage_agent.engine.executor import ExecutionRunner
         cfg = state.get("config") or AgentConfig()
+        cluster: list | None = state.get("cluster")
         exec_result = ExecutionRunner(credentials).run(
             state["draft_test"],
             state["target_gap"],
             config=cfg,
             baseline_coverage=state.get("baseline_coverage", {}),
+            cluster=cluster,
         )
         logger.info(
             "execution_runner: gap=%s success=%s branch_hit=%s targets=%d/%d",
@@ -168,21 +174,52 @@ def _make_execution_runner_node(credentials: Credentials):
                 )
             else:
                 gap = state["target_gap"]
+                # Build critique naming missed arcs, including sibling gaps.
+                missed_arcs = _missed_arcs_from_cluster(
+                    cluster=cluster,
+                    primary_gap=gap,
+                    exec_result=exec_result,
+                )
                 hint = state["context"].branch_condition_hint if state.get("context") else None
                 hint_line = (
-                    f"\n\nThe condition controlling this branch is: `{hint}`\n"
+                    f"\n\nThe condition controlling the primary branch is: `{hint}`\n"
                     "Write test inputs that force this condition to evaluate to the untaken path."
                     if hint else ""
                 )
-                updates["last_critique"] = (
-                    "The previous attempt RAN SUCCESSFULLY but did not exercise "
-                    f"the target branch (line {gap.branch.from_line} -> {gap.branch.to_line})."
-                    f"{hint_line}"
-                )
+                if missed_arcs:
+                    arc_list = "\n".join(
+                        f"  - line {g.branch.from_line} -> line {g.branch.to_line}"
+                        for g in missed_arcs
+                    )
+                    updates["last_critique"] = (
+                        "The previous attempt RAN SUCCESSFULLY but did not exercise "
+                        f"the following uncovered arcs of `{gap.target_symbol}`:\n"
+                        f"{arc_list}"
+                        f"{hint_line}"
+                    )
+                else:
+                    updates["last_critique"] = (
+                        "The previous attempt RAN SUCCESSFULLY but did not exercise "
+                        f"the target branch (line {gap.branch.from_line} -> {gap.branch.to_line})."
+                        f"{hint_line}"
+                    )
             updates["loop_count"] = state["loop_count"] + 1
 
         return updates
     return _execution_runner_node
+
+
+def _missed_arcs_from_cluster(
+    cluster: list | None,
+    primary_gap,
+    exec_result,
+) -> list:
+    """Returns list of gaps in cluster whose arc was not hit by exec_result."""
+    from coverage_agent.engine.executor import _cluster_results_from_exec
+    if not cluster or len(cluster) <= 1:
+        return []
+    per_gap = _cluster_results_from_exec(cluster, exec_result)
+    return [g for g, r in zip(cluster, per_gap) if not r.target_branch_hit]
 
 
 def _accept_node(state: PipelineState) -> dict:
@@ -321,14 +358,25 @@ def run_pipeline(
     baseline_coverage: Optional[dict] = None,
     repo_path: str = "",
     event_callback=None,
+    cluster: Optional[list] = None,
 ) -> tuple[GapResult, PipelineState]:
-    """Runs one gap through the full LangGraph pipeline. Returns a GapResult."""
+    """Runs one gap (or a cluster sharing file+symbol) through the full pipeline.
+
+    When cluster is None or length 1, behaviour is identical to the pre-clustering
+    code path.  When cluster has >1 gaps, the writer receives all sibling arcs and
+    the executor verifies each gap independently; the primary gap (first in cluster)
+    drives context building and determines the returned GapResult.
+
+    Returns a GapResult for the primary gap and the final PipelineState.  Callers
+    that need per-gap results for every sibling should use run_pipeline_cluster.
+    """
     cfg = config or AgentConfig()
     compiled = build_pipeline(credentials, event_callback=event_callback)
 
     initial_state: PipelineState = {
         "repo_path": repo_path,
         "target_gap": gap,
+        "cluster": cluster,
         "baseline_coverage": baseline_coverage or {},
         "config": cfg,
         "context": None,
@@ -345,16 +393,88 @@ def run_pipeline(
 
     final_state: PipelineState = compiled.invoke(initial_state)
 
-    accepted = credentials.should_commit(final_state.get("exec_result"))
+    # The primary exec_result drives acceptance: >=1 arc in the cluster was hit.
+    exec_result = final_state.get("exec_result")
+    accepted = credentials.should_commit(exec_result)
     gap_result = GapResult(
         gap=gap,
         skipped=final_state["skipped"],
         loops_taken=final_state["loop_count"],
         validation=final_state.get("eval_result"),
-        execution=final_state.get("exec_result"),
+        execution=exec_result,
         accepted=accepted,
         test_code=final_state["draft_test"].test_code if accepted and final_state.get("draft_test") else None,
         gap_difficulty=final_state.get("gap_difficulty", "easy"),
     )
 
     return gap_result, final_state
+
+
+def run_pipeline_cluster(
+    cluster: list[CoverageGap],
+    credentials: Credentials,
+    config: Optional[AgentConfig] = None,
+    baseline_coverage: Optional[dict] = None,
+    repo_path: str = "",
+    event_callback=None,
+) -> tuple[list[GapResult], PipelineState]:
+    """Runs a cluster of sibling gaps through one pipeline invocation.
+
+    Returns one GapResult per gap in cluster plus the final PipelineState.
+    The primary gap is cluster[0]; it drives context building exactly as today.
+
+    Acceptance rule: the test is kept if >=1 gap in the cluster was hit AND the
+    flake gate passes.  Each gap gets its own GapResult with its individual hit
+    status.  Gaps whose arc was not hit by the accepted test are recorded with
+    accepted=False and skip_reason naming the miss.
+    """
+    from coverage_agent.engine.executor import _cluster_results_from_exec
+
+    primary = cluster[0]
+    primary_result, final_state = run_pipeline(
+        gap=primary,
+        credentials=credentials,
+        config=config,
+        baseline_coverage=baseline_coverage,
+        repo_path=repo_path,
+        event_callback=event_callback,
+        cluster=cluster,
+    )
+
+    exec_result = final_state.get("exec_result")
+    test_code = primary_result.test_code
+    skipped = final_state["skipped"]
+
+    if len(cluster) == 1:
+        return [primary_result], final_state
+
+    # Build per-gap results using coverage data from the single execution.
+    per_exec = _cluster_results_from_exec(cluster, exec_result)
+
+    gap_results: list[GapResult] = []
+    for gap, gexec in zip(cluster, per_exec):
+        gap_accepted = (
+            not skipped
+            and gexec is not None
+            and credentials.should_commit(gexec)
+        )
+        skip_reason = ""
+        if not gap_accepted and not skipped and exec_result and exec_result.execution_success:
+            skip_reason = (
+                f"arc {gap.branch.from_line}->{gap.branch.to_line} not hit by accepted test"
+            )
+        elif skipped:
+            skip_reason = primary_result.skip_reason or "cluster skipped"
+        gap_results.append(GapResult(
+            gap=gap,
+            skipped=skipped or (not gap_accepted and skip_reason != ""),
+            loops_taken=final_state["loop_count"],
+            validation=final_state.get("eval_result"),
+            execution=gexec,
+            accepted=gap_accepted,
+            test_code=test_code if gap_accepted else None,
+            gap_difficulty=final_state.get("gap_difficulty", "easy"),
+            skip_reason=skip_reason,
+        ))
+
+    return gap_results, final_state

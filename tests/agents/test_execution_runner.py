@@ -238,3 +238,89 @@ def test_function_gap_no_body_lines_is_safe():
     gap = _make_function_gap(def_line=5, body=[])
     data = _FakeCovData(lines=[5])
     assert _check_targets(gap, data, "pkg/scoring.py") == (0, 0)
+
+
+# ---------------------------------------------------------------------------
+# _cluster_results_from_exec — per-gap result derivation
+# ---------------------------------------------------------------------------
+
+from coverage_agent.engine.executor import _cluster_results_from_exec, _cluster_arc_store
+from coverage_agent.contracts import ExecutionResult
+
+
+def _make_branch_gap(from_l: int, to_l: int) -> CoverageGap:
+    return CoverageGap(
+        file_path="pkg/stats.py",
+        target_symbol="letter_grade",
+        branch=BranchGap(from_line=from_l, to_line=to_l),
+        surrounding_lines=list(range(from_l, to_l + 2)),
+        kind="branch",
+        origin="full",
+        gap_id=f"pkg/stats.py:{from_l}->{to_l}",
+    )
+
+
+def test_cluster_results_single_gap_replicates():
+    """Single-gap cluster returns the exec_result directly."""
+    gap = _make_branch_gap(10, 12)
+    er = ExecutionResult(
+        execution_success=True,
+        target_branch_hit=True,
+        targets_hit=1,
+        targets_total=1,
+    )
+    results = _cluster_results_from_exec([gap], er)
+    assert len(results) == 1
+    assert results[0] is er
+
+
+def test_cluster_results_partial_acceptance():
+    """One arc hit, one missed → first accepted, second not."""
+    g1 = _make_branch_gap(35, 37)
+    g2 = _make_branch_gap(37, 38)
+    cluster = [g1, g2]
+
+    er = ExecutionResult(
+        execution_success=True,
+        target_branch_hit=True,   # any arc hit
+        targets_hit=1,
+        targets_total=2,
+    )
+    # Inject arc-hit data directly into the store.
+    _cluster_arc_store[id(er)] = {
+        (35, 37): True,
+        (37, 38): False,
+    }
+
+    results = _cluster_results_from_exec(cluster, er)
+    assert len(results) == 2
+    assert results[0].target_branch_hit is True
+    assert results[1].target_branch_hit is False
+    # Store entry is consumed.
+    assert id(er) not in _cluster_arc_store
+
+
+def test_cluster_results_none_exec_all_missed():
+    """None exec_result marks every gap as not executed."""
+    cluster = [_make_branch_gap(10, 12), _make_branch_gap(14, 16)]
+    results = _cluster_results_from_exec(cluster, None)
+    assert all(not r.execution_success for r in results)
+    assert all(not r.target_branch_hit for r in results)
+
+
+def test_cluster_results_fallback_when_no_arc_store():
+    """Without arc store data, only primary gap inherits the hit."""
+    g1 = _make_branch_gap(10, 12)
+    g2 = _make_branch_gap(14, 16)
+    cluster = [g1, g2]
+
+    er = ExecutionResult(
+        execution_success=True,
+        target_branch_hit=True,
+        targets_hit=1,
+        targets_total=1,
+    )
+    # No entry in _cluster_arc_store.
+    results = _cluster_results_from_exec(cluster, er)
+    assert results[0].target_branch_hit is True   # primary
+    assert results[1].target_branch_hit is False  # sibling — conservative

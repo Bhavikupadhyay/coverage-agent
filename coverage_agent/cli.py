@@ -81,9 +81,9 @@ def run(
 
     # Lazy import to keep startup fast.
     from coverage_agent.gaps.coverage_data import load_coverage_file, parse_coverage
-    from coverage_agent.gaps.select import select_gaps
+    from coverage_agent.gaps.select import select_gaps, cluster_gaps
     from coverage_agent.gaps.diff import compute_diff_gaps
-    from coverage_agent.engine.graph import run_pipeline
+    from coverage_agent.engine.graph import run_pipeline_cluster
     from coverage_agent.engine.regression import RegressionGuard
     from coverage_agent.report.run_report import serialize_run_report
 
@@ -94,8 +94,9 @@ def run(
         coverage_file=coverage_file,
         base_ref=base,
         output=output,
-        run_pipeline=run_pipeline,
+        run_pipeline_cluster=run_pipeline_cluster,
         select_gaps=select_gaps,
+        cluster_gaps=cluster_gaps,
         parse_coverage=parse_coverage,
         compute_diff_gaps=compute_diff_gaps,
         load_coverage_file=load_coverage_file,
@@ -110,8 +111,9 @@ def _run_pipeline(
     coverage_file: str,
     base_ref: str,
     output: str,
-    run_pipeline,
+    run_pipeline_cluster,
     select_gaps,
+    cluster_gaps,
     parse_coverage,
     compute_diff_gaps,
     load_coverage_file,
@@ -163,10 +165,16 @@ def _run_pipeline(
         all_gaps = parse_coverage(coverage_data, repo_root=repo_root, ignore_patterns=cfg.exclude)
 
     # Pull up to 2× the target so skipped gaps can be replaced from the tail.
+    # max_gaps semantics count individual gaps, not clusters.
     target_count = cfg.max_gaps
     candidate_gaps = select_gaps(all_gaps, max_gaps=target_count * 2, exclude=cfg.exclude)
+    clusters = cluster_gaps(candidate_gaps)
 
-    console.print(f"[bold]coverage-agent[/bold] scope={cfg.scope} gaps_found={len(all_gaps)} selected={len(candidate_gaps)}")
+    console.print(
+        f"[bold]coverage-agent[/bold] scope={cfg.scope} "
+        f"gaps_found={len(all_gaps)} selected={len(candidate_gaps)} "
+        f"clusters={len(clusters)}"
+    )
 
     if not candidate_gaps:
         console.print("[green]No actionable gaps found — nothing to do.[/green]")
@@ -180,49 +188,57 @@ def _run_pipeline(
         _write_output(report, output)
         return
 
-    # ---- Run engine per gap (with skip substitution) ----
+    # ---- Run engine per cluster (gap count enforces max_gaps, not cluster count) ----
     gap_results = []
     agent_traces = []
-    accepted_count = 0
-    attempted = 0
+    accepted_count = 0   # counts accepted gaps
+    attempted_gaps = 0   # counts attempted gaps (for substitution budget)
 
-    for gap in candidate_gaps:
-        if accepted_count >= target_count or attempted >= target_count * 2:
+    for cl in clusters:
+        if accepted_count >= target_count or attempted_gaps >= target_count * 2:
             break
-        attempted += 1
-        console.print(f"  [{attempted}] {gap.gap_id} ({gap.kind})")
+        attempted_gaps += len(cl)
+        primary = cl[0]
+        console.print(
+            f"  [{attempted_gaps}] {primary.gap_id} "
+            f"({primary.kind}) cluster_size={len(cl)}"
+        )
         try:
-            gap_result, final_state = run_pipeline(
-                gap=gap,
+            cluster_results, final_state = run_pipeline_cluster(
+                cluster=cl,
                 credentials=creds,
                 config=cfg,
                 baseline_coverage=coverage_data,
                 repo_path=repo_root,
             )
         except Exception as exc:
-            err_console.print(f"  [yellow]Warning:[/yellow] gap {gap.gap_id} failed: {exc}")
+            err_console.print(f"  [yellow]Warning:[/yellow] cluster {primary.gap_id} failed: {exc}")
             continue
-        gap_results.append(gap_result)
+        gap_results.extend(cluster_results)
 
         trace_steps = final_state.get("agent_trace") or []
         if trace_steps:
             from coverage_agent.contracts import AgentTrace
-            agent_traces.append(AgentTrace(gap_id=gap.gap_id, steps=trace_steps))
+            agent_traces.append(AgentTrace(gap_id=primary.gap_id, steps=trace_steps))
 
-        if gap_result.accepted and gap_result.test_code:
-            accepted_count += 1
+        # Write the test file once per cluster if any gap accepted it.
+        cluster_accepted = [r for r in cluster_results if r.accepted and r.test_code]
+        if cluster_accepted:
+            accepted_count += len(cluster_accepted)
             tests_dir = Path(repo_root) / cfg.tests_dir
             tests_dir.mkdir(parents=True, exist_ok=True)
             from coverage_agent.engine.regression import _filename_for
-            fname = tests_dir / _filename_for(gap_result)
-            fname.write_text(gap_result.test_code, encoding="utf-8")
-            console.print(f"    [green]✓ accepted[/green] → {fname.relative_to(repo_root)}")
+            # Use the first accepted result's filename (they share a test file).
+            rep = cluster_accepted[0]
+            fname = tests_dir / _filename_for(rep)
+            fname.write_text(rep.test_code, encoding="utf-8")
+            console.print(f"    [green]✓ accepted ({len(cluster_accepted)}/{len(cl)} arcs)[/green] → {fname.relative_to(repo_root)}")
         else:
             console.print(f"    [dim]skipped[/dim]")
 
     accepted = [r for r in gap_results if r.accepted]
 
-    # ---- RegressionGuard ----
+    # ---- RegressionGuard (runs once across all accepted gaps) ----
     regression = None
     if accepted:
         try:
@@ -439,9 +455,9 @@ def ci_run(
 
     # ---- Run pipeline ----
     from coverage_agent.gaps.coverage_data import load_coverage_file, parse_coverage
-    from coverage_agent.gaps.select import select_gaps
+    from coverage_agent.gaps.select import select_gaps, cluster_gaps
     from coverage_agent.gaps.diff import compute_diff_gaps
-    from coverage_agent.engine.graph import run_pipeline
+    from coverage_agent.engine.graph import run_pipeline_cluster
     from coverage_agent.engine.regression import RegressionGuard
     from coverage_agent.report.run_report import serialize_run_report
     from coverage_agent.report.markdown import render_comment
@@ -458,8 +474,9 @@ def ci_run(
         coverage_file=coverage_file,
         base_ref=base_ref,
         output=report_path,
-        run_pipeline=run_pipeline,
+        run_pipeline_cluster=run_pipeline_cluster,
         select_gaps=select_gaps,
+        cluster_gaps=cluster_gaps,
         parse_coverage=parse_coverage,
         compute_diff_gaps=compute_diff_gaps,
         load_coverage_file=load_coverage_file,

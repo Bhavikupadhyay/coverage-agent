@@ -71,6 +71,34 @@ def select_gaps(
     return selected
 
 
+def cluster_gaps(selected: list[CoverageGap]) -> list[list[CoverageGap]]:
+    """Groups gaps by (file_path, target_symbol) into clusters.
+
+    Cluster ordering follows the position of each cluster's first (best-ranked)
+    member in the input list — the selection order from select_gaps is preserved.
+    Within a cluster, gaps appear in their original selection order.
+
+    Args:
+        selected: Already-ranked list from select_gaps.
+
+    Returns:
+        Ordered list of clusters, each cluster an ordered list[CoverageGap].
+        Single-gap clusters are included as-is (list of length 1).
+    """
+    seen: dict[tuple[str, str], int] = {}   # (file, symbol) → cluster index
+    clusters: list[list[CoverageGap]] = []
+
+    for gap in selected:
+        key = (gap.file_path, gap.target_symbol)
+        if key not in seen:
+            seen[key] = len(clusters)
+            clusters.append([gap])
+        else:
+            clusters[seen[key]].append(gap)
+
+    return clusters
+
+
 def io_difficulty_flag(gap: CoverageGap, context: ContextPayload | None = None) -> str:
     """Returns 'hard' if the gap looks IO-heavy, 'easy' otherwise.
 

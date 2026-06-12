@@ -115,11 +115,23 @@ def _token_count(response) -> int:
         return 0
 
 
+def _build_arc_list(cluster: list, hint: str | None) -> str:
+    """Formats the arc list for a multi-gap cluster prompt."""
+    lines = []
+    for gap in cluster:
+        line = f"  - line {gap.branch.from_line} -> line {gap.branch.to_line}"
+        if gap.branch_condition_hint if hasattr(gap, "branch_condition_hint") else False:
+            line += f"  (condition: `{gap.branch_condition_hint}`)"  # type: ignore[attr-defined]
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def _build_user_prompt(
     gap: CoverageGap,
     context: ContextPayload,
     critique: str | None,
     react_mode: bool,
+    cluster: list | None = None,
 ) -> str:
     deps_section = ""
     if context.dependencies_code:
@@ -127,16 +139,36 @@ def _build_user_prompt(
             f"# {name}\n{src}" for name, src in context.dependencies_code.items()
         )
 
-    hint_section = ""
-    if context.branch_condition_hint:
-        hint_section = (
-            f"\n\nBranch trigger condition (line {gap.branch.from_line}): "
-            f"`{context.branch_condition_hint}`\n"
-            "To hit the target branch, choose test inputs that make this "
-            "condition evaluate the right way. Reason carefully about which "
-            "direction (truthy vs falsy) leads to the uncovered line "
-            f"{gap.branch.to_line}."
+    # Multi-arc cluster: list every uncovered arc and ask for one file covering all.
+    effective_cluster = cluster if cluster and len(cluster) > 1 else None
+
+    if effective_cluster:
+        arc_lines = []
+        for g in effective_cluster:
+            entry = f"  - line {g.branch.from_line} -> line {g.branch.to_line}"
+            # Attach per-arc hint from the ContextPayload when it corresponds to
+            # the primary gap (the only one whose hint we have).
+            if g is effective_cluster[0] and context.branch_condition_hint:
+                entry += f"  (condition: `{context.branch_condition_hint}`)"
+            arc_lines.append(entry)
+        arc_block = "\n".join(arc_lines)
+        task_line = (
+            f"Write tests that cover ALL of the following uncovered branches of "
+            f"`{gap.target_symbol}` in one test file:\n{arc_block}"
         )
+        hint_section = ""
+    else:
+        task_line = "Write 1-2 pytest test functions that cover the following uncovered branch."
+        hint_section = ""
+        if context.branch_condition_hint:
+            hint_section = (
+                f"\n\nBranch trigger condition (line {gap.branch.from_line}): "
+                f"`{context.branch_condition_hint}`\n"
+                "To hit the target branch, choose test inputs that make this "
+                "condition evaluate the right way. Reason carefully about which "
+                "direction (truthy vs falsy) leads to the uncovered line "
+                f"{gap.branch.to_line}."
+            )
 
     retry_section = ""
     if critique:
@@ -155,11 +187,18 @@ def _build_user_prompt(
         if react_mode else ""
     )
 
+    if effective_cluster:
+        arc_detail = f"\n\nFile: {gap.file_path}\nFunction: {gap.target_symbol}"
+    else:
+        arc_detail = (
+            f"\n\nFile: {gap.file_path}\n"
+            f"Function: {gap.target_symbol}\n"
+            f"Uncovered branch: line {gap.branch.from_line} -> line {gap.branch.to_line}"
+        )
+
     return (
-        f"Write 1-2 pytest test functions that cover the following uncovered branch.\n\n"
-        f"File: {gap.file_path}\n"
-        f"Function: {gap.target_symbol}\n"
-        f"Uncovered branch: line {gap.branch.from_line} -> line {gap.branch.to_line}\n"
+        f"{task_line}"
+        f"{arc_detail}"
         f"{_layout_import_hint(gap.file_path)}"
         f"\nTarget function source:\n```python\n{context.primary_code}\n```"
         f"{deps_section}"
@@ -186,6 +225,7 @@ class TestWriter:
         critique: str | None = None,
         config: AgentConfig | None = None,
         trace: list | None = None,
+        cluster: list | None = None,
     ) -> DraftTest:
         cfg = config or AgentConfig()
         use_react = (
@@ -194,9 +234,9 @@ class TestWriter:
         )
 
         if use_react:
-            test_code = self._generate_react(gap, context, critique, cfg, trace or [])
+            test_code = self._generate_react(gap, context, critique, cfg, trace or [], cluster=cluster)
         else:
-            test_code = self._generate_single_shot(gap, context, critique)
+            test_code = self._generate_single_shot(gap, context, critique, cluster=cluster)
 
         return DraftTest(
             test_code=test_code,
@@ -209,8 +249,9 @@ class TestWriter:
         gap: CoverageGap,
         context: ContextPayload,
         critique: str | None,
+        cluster: list | None = None,
     ) -> str:
-        user_prompt = _build_user_prompt(gap, context, critique, react_mode=False)
+        user_prompt = _build_user_prompt(gap, context, critique, react_mode=False, cluster=cluster)
         try:
             response = _completion(
                 messages=[
@@ -232,6 +273,7 @@ class TestWriter:
         critique: str | None,
         cfg: AgentConfig,
         trace: list,
+        cluster: list | None = None,
     ) -> str:
         from coverage_agent.engine import tools as _tools
 
@@ -247,7 +289,7 @@ class TestWriter:
 
         messages = [
             {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": _build_user_prompt(gap, context, critique, react_mode=True)},
+            {"role": "user", "content": _build_user_prompt(gap, context, critique, react_mode=True, cluster=cluster)},
         ]
 
         total_tokens = 0

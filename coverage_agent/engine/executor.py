@@ -30,6 +30,13 @@ from coverage_agent.contracts import CoverageGap, DraftTest, ExecutionResult
 
 logger = logging.getLogger(__name__)
 
+# Per-run arc-hit data for cluster verification.  Keyed by id(ExecutionResult).
+# Entries are written by _run_once and consumed (and removed) by
+# _cluster_results_from_exec.  Private implementation detail — never part of
+# any external contract.
+_cluster_arc_store: dict[int, dict] = {}
+
+
 def _check_targets(
     gap: CoverageGap,
     cov_data,
@@ -75,6 +82,57 @@ def _check_targets(
     return hit, total
 
 
+def _cluster_results_from_exec(
+    cluster: list,
+    exec_result: "ExecutionResult | None",
+) -> list:
+    """Returns one ExecutionResult per gap in cluster based on exec_result.
+
+    When exec_result is None (pipeline was skipped or errored before execution),
+    every gap gets a not-hit result.  Otherwise each gap's arc-hit status is read
+    independently from exec_result's coverage data — but because the executor ran
+    only once we derive per-gap hit from the stored target arcs via the same
+    _check_targets helper, re-loading the coverage data from exec_result._cov_data
+    when available, or falling back to target_branch_hit for single-gap clusters.
+    """
+    if exec_result is None:
+        return [
+            ExecutionResult(
+                execution_success=False,
+                target_branch_hit=False,
+            )
+            for _ in cluster
+        ]
+
+    # Fast path: single-gap cluster — just replicate the result.
+    if len(cluster) <= 1:
+        return [exec_result]
+
+    # For multi-gap clusters we need to check each arc individually.
+    # _run_once stored per-arc hit data in _cluster_arc_store keyed by the
+    # result's id().  Consume and remove the entry to avoid unbounded growth.
+    arc_hits: dict = _cluster_arc_store.pop(id(exec_result), {})
+
+    results = []
+    for gap in cluster:
+        arc_key = (gap.branch.from_line, gap.branch.to_line)
+        if arc_hits:
+            hit = arc_hits.get(arc_key, False)
+        else:
+            # No per-gap data — conservatively, only the primary gap inherits the hit.
+            hit = (gap is cluster[0]) and exec_result.target_branch_hit
+        results.append(ExecutionResult(
+            execution_success=exec_result.execution_success,
+            target_branch_hit=hit,
+            targets_hit=1 if hit else 0,
+            targets_total=1,
+            stderr_trace=exec_result.stderr_trace,
+            flaky=exec_result.flaky,
+            is_system_error=exec_result.is_system_error,
+        ))
+    return results
+
+
 _SYSTEM_ERROR_PATTERNS: tuple[str, ...] = (
     "Can't append to data files in parallel mode",
     "ModuleNotFoundError",
@@ -114,8 +172,14 @@ def _run_once(
     cwd: str,
     timeout: int,
     python_executable: str = "",
+    cluster: list | None = None,
 ) -> ExecutionResult:
-    """Runs one pytest + coverage pass and returns an ExecutionResult."""
+    """Runs one pytest + coverage pass and returns an ExecutionResult.
+
+    When cluster has >1 gaps, checks every arc in the cluster and stores the
+    per-arc hit map in the result's _cluster_arc_hits attribute so callers can
+    build individual GapResults without re-reading coverage data.
+    """
     junit_xml = test_file.with_suffix(".xml")
     python = python_executable or sys.executable
 
@@ -152,6 +216,7 @@ def _run_once(
     # pytest passed — check target coverage by gap kind.
     targets_hit = 0
     targets_total = 1
+    arc_hits: dict = {}
     try:
         import coverage as coverage_module
         cov = coverage_module.Coverage(data_file=str(cov_data_file))
@@ -159,21 +224,48 @@ def _run_once(
         data = cov.get_data()
         abs_target = str(Path(cwd) / gap.file_path)
         targets_hit, targets_total = _check_targets(gap, data, abs_target)
+
+        # Build per-arc hit map for every gap in the cluster.
+        effective_cluster = cluster if cluster and len(cluster) > 1 else None
+        if effective_cluster:
+            for g in effective_cluster:
+                h, _ = _check_targets(g, data, abs_target)
+                # For branch gaps (h, t) = (0 or 1, 1); for others use >=1 and >=0.5 rule.
+                if g.kind == "branch":
+                    arc_hits[(g.branch.from_line, g.branch.to_line)] = h >= 1
+                else:
+                    t_h, t_t = _check_targets(g, data, abs_target)
+                    arc_hits[(g.branch.from_line, g.branch.to_line)] = (
+                        t_h >= 1 and t_t > 0 and t_h / t_t >= 0.5
+                    )
     except Exception as exc:
         logger.debug("Coverage check failed for %s: %s", gap.gap_id, exc)
 
-    accepted = (
-        targets_hit >= 1
-        and targets_total > 0
-        and targets_hit / targets_total >= 0.5
-    )
-    return ExecutionResult(
+    # Primary acceptance: >=1 arc hit (for single-gap this is the usual rule).
+    # For clusters, target_branch_hit=True if ANY arc in the cluster was hit —
+    # this drives the should_commit gate so the test is kept.
+    if arc_hits:
+        any_hit = any(arc_hits.values())
+        primary_hit = arc_hits.get((gap.branch.from_line, gap.branch.to_line), False)
+        accepted = any_hit
+    else:
+        primary_hit = (
+            targets_hit >= 1
+            and targets_total > 0
+            and targets_hit / targets_total >= 0.5
+        )
+        accepted = primary_hit
+
+    exec_result = ExecutionResult(
         execution_success=True,
         target_branch_hit=accepted,
         targets_hit=targets_hit,
         targets_total=targets_total,
         stderr_trace=stderr,
     )
+    if arc_hits:
+        _cluster_arc_store[id(exec_result)] = arc_hits
+    return exec_result
 
 
 class ExecutionRunner:
@@ -190,18 +282,20 @@ class ExecutionRunner:
         baseline_coverage: dict | None = None,
         # Legacy sandbox parameter — kept for backwards compat with old tests only.
         sandbox=None,
+        cluster: list | None = None,
     ) -> ExecutionResult:
         if sandbox is not None:
             return self._run_sandbox(draft, gap, sandbox, baseline_coverage)
 
         cfg = config or AgentConfig()
-        return self._run_subprocess(draft, gap, cfg)
+        return self._run_subprocess(draft, gap, cfg, cluster=cluster)
 
     def _run_subprocess(
         self,
         draft: DraftTest,
         gap: CoverageGap,
         cfg: AgentConfig,
+        cluster: list | None = None,
     ) -> ExecutionResult:
         tests_dir = Path(cfg.tests_dir)
         tests_dir.mkdir(parents=True, exist_ok=True)
@@ -216,7 +310,7 @@ class ExecutionRunner:
             timeout = cfg.test_timeout
 
             try:
-                first = _run_once(tmp_test, gap, cov_data_file, cwd, timeout, python_executable)
+                first = _run_once(tmp_test, gap, cov_data_file, cwd, timeout, python_executable, cluster=cluster)
             except subprocess.TimeoutExpired:
                 return ExecutionResult(
                     execution_success=False,
@@ -234,7 +328,7 @@ class ExecutionRunner:
             results = [first]
             for _ in range(cfg.flaky_runs - 1):
                 try:
-                    r = _run_once(tmp_test, gap, cov_data_file, cwd, timeout, python_executable)
+                    r = _run_once(tmp_test, gap, cov_data_file, cwd, timeout, python_executable, cluster=cluster)
                     results.append(r)
                 except subprocess.TimeoutExpired:
                     results.append(ExecutionResult(

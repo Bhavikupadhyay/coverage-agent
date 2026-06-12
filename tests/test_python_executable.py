@@ -139,7 +139,7 @@ def test_execution_runner_threads_python_executable(creds, tmp_path, monkeypatch
 
     captured_kwargs = {}
 
-    def _fake_run_once(test_file, gap, cov_data_file, cwd, timeout, python_executable=""):
+    def _fake_run_once(test_file, gap, cov_data_file, cwd, timeout, python_executable="", cluster=None):
         captured_kwargs["python_executable"] = python_executable
         return ExecutionResult(
             execution_success=True,

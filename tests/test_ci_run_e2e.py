@@ -134,9 +134,9 @@ def test_ci_run_preview_renders_correct_comment(tmp_path, monkeypatch):
         rendered_comments.append(body)
 
     from coverage_agent.gaps.coverage_data import load_coverage_file, parse_coverage
-    from coverage_agent.gaps.select import select_gaps
+    from coverage_agent.gaps.select import select_gaps, cluster_gaps
     from coverage_agent.gaps.diff import compute_diff_gaps
-    from coverage_agent.engine.graph import run_pipeline as _run_pipeline_fn
+    from coverage_agent.engine.graph import run_pipeline_cluster as _run_pipeline_cluster_fn
     from coverage_agent.engine.regression import RegressionGuard
     from coverage_agent.report.run_report import serialize_run_report
     from coverage_agent.report.markdown import render_comment, COMMENT_MARKER
@@ -154,8 +154,9 @@ def test_ci_run_preview_renders_correct_comment(tmp_path, monkeypatch):
             coverage_file=cov_path,
             base_ref="",
             output=report_path,
-            run_pipeline=_run_pipeline_fn,
+            run_pipeline_cluster=_run_pipeline_cluster_fn,
             select_gaps=select_gaps,
+            cluster_gaps=cluster_gaps,
             parse_coverage=parse_coverage,
             compute_diff_gaps=compute_diff_gaps,
             load_coverage_file=load_coverage_file,

@@ -3,8 +3,8 @@ import ast
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from coverage_agent.engine.writer import TestWriter, _layout_import_hint
-from coverage_agent.contracts import DraftTest
+from coverage_agent.engine.writer import TestWriter, _layout_import_hint, _build_user_prompt
+from coverage_agent.contracts import BranchGap, ContextPayload, CoverageGap, DraftTest
 
 _FIXTURE_TEST = (
     Path(__file__).parent.parent.parent / "coverage_agent" / "fixtures" / "sample_test.py"
@@ -79,6 +79,65 @@ def test_react_tool_call_loop(creds, sample_gap, sample_context):
 
     mock_dispatch.assert_called_once()
     assert "def test_" in draft.test_code or "class Test" in draft.test_code
+
+
+# ---------------------------------------------------------------------------
+# Multi-arc cluster prompt content
+# ---------------------------------------------------------------------------
+
+def _make_gap(symbol: str, from_l: int, to_l: int) -> CoverageGap:
+    return CoverageGap(
+        file_path="pkg/stats.py",
+        target_symbol=symbol,
+        branch=BranchGap(from_line=from_l, to_line=to_l),
+        surrounding_lines=list(range(from_l, to_l + 3)),
+        kind="branch",
+        origin="full",
+        gap_id=f"pkg/stats.py:{from_l}->{to_l}",
+    )
+
+
+def _make_context() -> ContextPayload:
+    return ContextPayload(
+        primary_code="def letter_grade(score):\n    if score >= 90:\n        return 'A'\n",
+        dependencies_code={},
+        graph_depth_used=1,
+        tokens_used=80,
+    )
+
+
+def test_single_gap_prompt_unchanged(sample_gap, sample_context):
+    """Single-gap path produces the same singular wording as before clustering."""
+    prompt = _build_user_prompt(sample_gap, sample_context, critique=None, react_mode=False, cluster=None)
+    assert "Write 1-2 pytest test functions" in prompt
+    assert "Uncovered branch:" in prompt
+
+
+def test_multi_arc_prompt_lists_all_arcs():
+    """Cluster prompt names the target symbol and lists every arc."""
+    g1 = _make_gap("letter_grade", 35, 37)
+    g2 = _make_gap("letter_grade", 37, 38)
+    g3 = _make_gap("letter_grade", 37, 40)
+    ctx = _make_context()
+
+    prompt = _build_user_prompt(g1, ctx, critique=None, react_mode=False, cluster=[g1, g2, g3])
+
+    assert "letter_grade" in prompt
+    assert "line 35 -> line 37" in prompt
+    assert "line 37 -> line 38" in prompt
+    assert "line 37 -> line 40" in prompt
+    # The cluster heading replaces the single-gap wording.
+    assert "ALL" in prompt
+    assert "Write 1-2 pytest test functions" not in prompt
+
+
+def test_single_element_cluster_behaves_as_single_gap():
+    """A cluster of 1 is treated identically to the no-cluster path."""
+    g1 = _make_gap("compute", 10, 12)
+    ctx = _make_context()
+    prompt_no_cluster = _build_user_prompt(g1, ctx, critique=None, react_mode=False, cluster=None)
+    prompt_single = _build_user_prompt(g1, ctx, critique=None, react_mode=False, cluster=[g1])
+    assert prompt_no_cluster == prompt_single
 
 
 def test_critique_included_in_retry_prompt(creds, sample_gap, sample_context):

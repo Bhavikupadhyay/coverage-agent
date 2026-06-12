@@ -8,7 +8,7 @@ from unittest.mock import patch, MagicMock
 import pytest
 
 from coverage_agent.contracts import BranchGap, CoverageGap
-from coverage_agent.gaps.select import select_gaps, io_difficulty_flag, _is_io_heavy
+from coverage_agent.gaps.select import select_gaps, io_difficulty_flag, _is_io_heavy, cluster_gaps
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +122,62 @@ def test_is_io_heavy_patterns(symbol, expected):
 # select_gaps: when the candidate pool is 2× target, skipped gaps are
 # replaced from the tail so accepted_count reaches target_count).
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# cluster_gaps
+# ---------------------------------------------------------------------------
+
+def test_cluster_gaps_groups_by_file_and_symbol():
+    """Two gaps sharing file+symbol form one cluster; a third with different symbol is separate."""
+    g1 = _gap(symbol="compute", file="pkg/mod.py", from_l=10, to_l=11)
+    g2 = _gap(symbol="compute", file="pkg/mod.py", from_l=12, to_l=13)
+    g3 = _gap(symbol="validate", file="pkg/mod.py", from_l=20, to_l=21)
+
+    clusters = cluster_gaps([g1, g2, g3])
+    assert len(clusters) == 2
+    assert len(clusters[0]) == 2
+    assert len(clusters[1]) == 1
+    # Ordering follows first-occurrence: compute before validate.
+    assert clusters[0][0].target_symbol == "compute"
+    assert clusters[1][0].target_symbol == "validate"
+
+
+def test_cluster_gaps_separates_different_files():
+    """Same symbol in two different files → two clusters."""
+    g1 = _gap(symbol="compute", file="pkg/a.py", from_l=10, to_l=11)
+    g2 = _gap(symbol="compute", file="pkg/b.py", from_l=10, to_l=11)
+
+    clusters = cluster_gaps([g1, g2])
+    assert len(clusters) == 2
+    assert clusters[0][0].file_path == "pkg/a.py"
+    assert clusters[1][0].file_path == "pkg/b.py"
+
+
+def test_cluster_gaps_preserves_selection_ordering():
+    """Cluster ordering follows first-seen order from the input (select_gaps ranking)."""
+    # Second symbol first in list, then first symbol.
+    g1 = _gap(symbol="beta", file="pkg/mod.py", from_l=30, to_l=31)
+    g2 = _gap(symbol="alpha", file="pkg/mod.py", from_l=10, to_l=11)
+    g3 = _gap(symbol="beta", file="pkg/mod.py", from_l=32, to_l=33)
+
+    clusters = cluster_gaps([g1, g2, g3])
+    # beta cluster comes first because its first member (g1) appeared first.
+    assert clusters[0][0].target_symbol == "beta"
+    assert len(clusters[0]) == 2
+    assert clusters[1][0].target_symbol == "alpha"
+
+
+def test_cluster_gaps_single_gap_per_cluster():
+    """When every gap has a unique (file, symbol), each becomes a 1-element cluster."""
+    gaps = [_gap(symbol=f"fn_{i}", from_l=i * 10, to_l=i * 10 + 1) for i in range(4)]
+    clusters = cluster_gaps(gaps)
+    assert len(clusters) == 4
+    assert all(len(c) == 1 for c in clusters)
+
+
+def test_cluster_gaps_empty_input():
+    assert cluster_gaps([]) == []
+
 
 def test_select_gaps_double_pool_covers_skips():
     """2× pool means skipped gaps can be replaced to hit the target count."""
