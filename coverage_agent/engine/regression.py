@@ -130,11 +130,16 @@ class RegressionGuard:
                 skipped=True,
             )
 
-        # Write accepted tests to tests_dir.
+        # Write accepted tests to tests_dir. Gaps in the same cluster share one
+        # test file's code — write each unique test once, not once per gap.
         tests_dir = Path(repo_root) / cfg.tests_dir
         tests_dir.mkdir(parents=True, exist_ok=True)
         written: list[Path] = []
+        seen_codes: set[str] = set()
         for r in committed:
+            if r.test_code in seen_codes:
+                continue
+            seen_codes.add(r.test_code)
             dest = tests_dir / _filename_for(r)
             try:
                 dest.write_text(r.test_code, encoding="utf-8")
